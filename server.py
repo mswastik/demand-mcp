@@ -20,10 +20,16 @@ Tools exposed:
         9.  get_forecast_evolution
         10. get_top_offenders
 
-    Presentation:
+    Presentation (standard workflow):
         11. initialize_presentation
         12. add_slide
         13. finalize_presentation
+
+    Efficient report generation (NEW):
+        14. generate_standard_report  — pre-compute all standard slides in one call
+        15. add_commentary            — LLM writes text to a named slide
+        16. get_presentation_status   — list slide IDs + commentary state (resume support)
+        17. drill_down_slide          — append one drill-down slide at any hierarchy level
 """
 
 from __future__ import annotations
@@ -155,7 +161,7 @@ def _get_ds():
 
 # ── Helper: DataFrame → JSON-serialisable dict ───────────────────────────────
 
-def _df_to_dict(df: pl.DataFrame, max_rows: int = 200) -> dict:
+def _df_to_dict(df: pl.DataFrame, max_rows: int = 50) -> dict:
     """Convert polars DataFrame to a JSON-safe dict for MCP responses."""
     if df.is_empty():
         return {"columns": [], "rows": [], "row_count": 0}
@@ -785,6 +791,292 @@ def finalize_presentation(filename: Optional[str] = None) -> dict:
         "output_path": str(out_path),
         "slide_count": slide_count,
         "file_size_kb": round(out_path.stat().st_size / 1024, 1),
+    }
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# TOOL 14 — generate_standard_report
+# ════════════════════════════════════════════════════════════════════════════
+
+@mcp.tool()
+def generate_standard_report(
+    window: str = "last_3_months",
+    filters: Optional[dict] = None,
+) -> dict:
+    """
+    *** START HERE for presentation creation. ***
+
+    Pre-computes all standard metrics at multiple hierarchy levels, builds 9
+    standard slides automatically (cover, KPI summary, accuracy trend, Forecast
+    Level table, Product Line table, IBP Level 5 table, bias chart, FVA chart,
+    YoY growth chart), and returns a compact layered briefing JSON (~700 tokens).
+
+    The LLM should:
+      1. Call generate_standard_report() — slides are built, briefing returned.
+      2. Read the briefing and write commentary for each slide with add_commentary().
+      3. Optionally call drill_down_slide() for anomalies worth investigating.
+      4. Call finalize_presentation() to write the HTML file.
+
+    Parameters
+    ----------
+    window  : time window — 'last_month', 'last_3_months', 'last_12_months',
+              'ytd', or 'YYYY-MM:YYYY-MM'. Default: last_3_months.
+    filters : optional {col: value} to scope to a Franchise, Product Line, etc.
+              e.g. {"Franchise": "Trauma"}
+              Omit for a full-portfolio report.
+
+    Returns
+    -------
+    briefing : dict with keys:
+        window, filters_applied, date_range,
+        by_forecast_level  — list of {Forecast Level, df_acc, stat_acc, bias_pct, fva, act_vol}
+        by_product_line    — list of same shape, ranked worst first
+        by_ibp5            — list of same shape at IBP Level 5 grain
+        root_cause_hints   — top 5 worst CatalogNumber/IBP Level 7 rows for commentary
+        trend              — {months, df_acc, stat_acc} arrays for 12-month chart
+        yoy                — [{year, act_vol, yoy_pct}, ...] last 3 years
+        slides_created     — list of {slide_id, title} for slides just built
+    """
+    state = _get_state()
+    if state.presentation is None:
+        return {
+            "error": (
+                "No presentation initialized. "
+                "Call initialize_presentation(title, subtitle) first, then call this tool."
+            )
+        }
+
+    from briefing import generate_standard_report as _briefing, build_standard_slides
+
+    ds = _get_ds()
+    briefing = _briefing(ds, window=window, filters=filters)
+    build_standard_slides(briefing, state.presentation)
+
+    # Append a compact slides_created list to the briefing so the LLM knows
+    # what to write commentary for without needing to call get_presentation_status()
+    briefing["slides_created"] = [
+        {"slide_id": s["slide_id"], "title": s["title"]}
+        for s in state.presentation.status()
+    ]
+
+    return briefing
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# TOOL 15 — add_commentary
+# ════════════════════════════════════════════════════════════════════════════
+
+@mcp.tool()
+def add_commentary(slide_id: str, commentary: str) -> dict:
+    """
+    Add or update the commentary text on a specific slide.
+
+    Call this after generate_standard_report() to write narrative for each slide.
+    The LLM should write 2-4 bullet points or sentences per slide based on the
+    briefing data returned by generate_standard_report().
+
+    Parameters
+    ----------
+    slide_id   : 8-char or named slide ID from get_presentation_status() or
+                 slides_created in generate_standard_report() response.
+                 Standard slide IDs: 'cover', 'kpi_summary', 'accuracy_trend',
+                 'by_forecast_level', 'by_product_line', 'by_ibp5',
+                 'bias_summary', 'fva_summary', 'yoy_growth'.
+    commentary : Text to display in the commentary box. Supports plain text and
+                 HTML fragments, e.g.:
+                 '<ul><li>Point 1</li><li>Point 2</li></ul>'
+                 For bullet lists: '<ul><li>...</li></ul>'
+                 For bold text: '<strong>key term</strong>'
+
+    Returns
+    -------
+    {status, slide_id, title} or {error} if slide_id not found.
+    """
+    state = _get_state()
+    if state.presentation is None:
+        return {"error": "No presentation initialized. Call initialize_presentation first."}
+
+    slide = state.presentation.add_commentary_by_id(slide_id, commentary)
+    if slide is None:
+        available = [s["slide_id"] for s in state.presentation.status()]
+        return {
+            "error": f"slide_id '{slide_id}' not found.",
+            "available_slide_ids": available,
+        }
+
+    return {
+        "status": "commentary_added",
+        "slide_id": slide.slide_id,
+        "title": slide.title,
+    }
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# TOOL 16 — get_presentation_status
+# ════════════════════════════════════════════════════════════════════════════
+
+@mcp.tool()
+def get_presentation_status() -> dict:
+    """
+    Return the current state of all slides in the presentation.
+
+    Use this to:
+    - See which slides already have commentary (has_commentary: true) vs. need it.
+    - Resume after a context reset — call this one tool to know exactly where
+      you left off before continuing with add_commentary() or drill_down_slide().
+    - Verify that generate_standard_report() created the expected slides.
+
+    Returns
+    -------
+    {
+        "slide_count": int,
+        "slides": [
+            {
+                "slide_index": int,
+                "slide_id": str,
+                "title": str,
+                "layout": str,
+                "has_commentary": bool
+            },
+            ...
+        ],
+        "commentary_complete": bool  # true if all slides have commentary
+    }
+    """
+    state = _get_state()
+    if state.presentation is None:
+        return {"error": "No presentation initialized. Call initialize_presentation first."}
+
+    slides = state.presentation.status()
+    return {
+        "slide_count": len(slides),
+        "slides": slides,
+        "commentary_complete": all(s["has_commentary"] for s in slides) if slides else False,
+    }
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# TOOL 17 — drill_down_slide
+# ════════════════════════════════════════════════════════════════════════════
+
+@mcp.tool()
+def drill_down_slide(
+    hierarchy_col: str,
+    hierarchy_value: str,
+    metric: str = "accuracy",
+    window: str = "last_3_months",
+    filters: Optional[dict] = None,
+) -> dict:
+    """
+    Append a focused drill-down slide for any product or location hierarchy node.
+
+    This tool automatically resolves the NEXT level down in the hierarchy and
+    computes a metric table at that level, scoped to the parent node.
+
+    Hierarchy drill paths
+    ---------------------
+    Product : Franchise → Product Line → IBP Level 5 → IBP Level 6
+                        → IBP Level 7 → CatalogNumber
+    Location: Forecast Level → Area / Region → Country
+
+    Parameters
+    ----------
+    hierarchy_col   : The column of the PARENT node you are drilling from.
+                      e.g. 'Franchise', 'Product Line', 'IBP Level 5',
+                           'Forecast Level', 'Region'
+    hierarchy_value : The value to scope to at hierarchy_col level.
+                      e.g. 'Trauma', 'Trauma Nails', 'APAC'
+    metric          : What to analyse at the next level down:
+                      'accuracy'     — grouped bar: DF vs Stat accuracy %
+                      'bias'         — bar: DF bias %
+                      'fva'          — bar: Forecast Value Add %
+                      'trend'        — line: monthly accuracy trend
+                      'top_offenders'— table: worst performers ranked by abs error
+    window          : time window string (default: last_3_months)
+    filters         : optional additional filters, e.g. {"Region": "APAC"}
+                      Combined with hierarchy_col=hierarchy_value filter.
+
+    Returns
+    -------
+    {
+        "slide_id"        : str    — use with add_commentary()
+        "title"           : str
+        "drill_level"     : str    — the column drilled INTO (next level)
+        "parent_col"      : str
+        "parent_value"    : str
+        "briefing_summary": list   — compact rows for LLM commentary (~200 tokens)
+    }
+    """
+    state = _get_state()
+    if state.presentation is None:
+        return {"error": "No presentation initialized. Call initialize_presentation first."}
+
+    from briefing import compute_drill_down
+    from presentation import Slide, ChartSpec, TableSpec
+
+    ds = _get_ds()
+
+    try:
+        result = compute_drill_down(
+            ds=ds,
+            hierarchy_col=hierarchy_col,
+            hierarchy_value=hierarchy_value,
+            metric=metric,
+            window=window,
+            filters=filters,
+        )
+    except ValueError as e:
+        return {"error": str(e)}
+
+    if "error" in result:
+        return result
+
+    drill_level = result["drill_level"]
+    slide_data = result["slide_data"]
+    layout = slide_data["layout"]
+    title = f"{metric.title()}: {hierarchy_value} → {drill_level}"
+
+    # Build ChartSpec / TableSpec from slide_data
+    def _cs(c):
+        if not c:
+            return None
+        return ChartSpec(
+            chart_type=c["chart_type"],
+            title=c["title"],
+            x_data=c["x_data"],
+            y_data=c["y_data"],
+            x_label=c.get("x_label", ""),
+            y_label=c.get("y_label", ""),
+            show_legend=c.get("show_legend", True),
+            height=c.get("height", 320),
+        )
+
+    def _ts(t):
+        if not t:
+            return None
+        return TableSpec(
+            headers=t["headers"],
+            rows=t["rows"],
+            highlight_col=t.get("highlight_col"),
+            highlight_thresholds=tuple(t["highlight_thresholds"]) if t.get("highlight_thresholds") else None,
+        )
+
+    slide = Slide(
+        layout=layout,
+        title=title,
+        chart=_cs(slide_data.get("chart_spec")),
+        table=_ts(slide_data.get("table_spec")),
+    )
+    state.presentation.add_slide(slide)
+
+    return {
+        "status": "slide_added",
+        "slide_id": slide.slide_id,
+        "title": title,
+        "drill_level": drill_level,
+        "parent_col": hierarchy_col,
+        "parent_value": hierarchy_value,
+        "briefing_summary": result["rows"],
     }
 
 

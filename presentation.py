@@ -57,6 +57,11 @@ class Slide:
     chart2: ChartSpec | None = None  # for two_col layout
     slide_id: str = field(default_factory=lambda: str(uuid.uuid4())[:8])
 
+    def __post_init__(self):
+        # Allow briefing.py to pass a fixed human-readable slide_id.
+        # If the field is still an auto-generated UUID fragment, leave it.
+        pass
+
 
 class PresentationBuilder:
     """Stateful presentation builder. One instance per presentation session."""
@@ -77,6 +82,27 @@ class PresentationBuilder:
 
     def add_slide(self, slide: Slide) -> None:
         self.slides.append(slide)
+
+    def add_commentary_by_id(self, slide_id: str, commentary: str) -> Slide | None:
+        """Find a slide by slide_id and update its commentary. Returns the slide or None."""
+        for slide in self.slides:
+            if slide.slide_id == slide_id:
+                slide.commentary = commentary
+                return slide
+        return None
+
+    def status(self) -> list[dict]:
+        """Return a compact status list for get_presentation_status()."""
+        return [
+            {
+                "slide_index": i,
+                "slide_id": s.slide_id,
+                "title": s.title,
+                "layout": s.layout,
+                "has_commentary": bool(s.commentary and s.commentary.strip()),
+            }
+            for i, s in enumerate(self.slides)
+        ]
 
     def finalize(self, filename: str | None = None) -> Path:
         if filename is None:
