@@ -1,0 +1,27 @@
+# demand_mcp server configuration
+# Edit these values before starting the server.
+
+# Path to the parquet data file
+parquet_path: "C:\\Users\\smishra14\\OneDrive - Stryker\\data\\APAC-Stat2.parquet"
+
+# Directory where HTML presentation output will be written
+output_dir: "output"
+
+# Path to brand configuration file
+brand_config: "brand.json"
+
+# Server settings
+server:
+  name: "demand-mcp"
+  host: "127.0.0.1"
+  port: 8000
+
+# Fiscal year start month (1=January, 4=April, 7=July, 10=October)
+fiscal_year_start_month: 1
+
+# Default analysis windows (used when caller does not specify)
+defaults:
+  # Primary lag used for top-level accuracy summaries
+  primary_lag: "L2"
+  # Default time windows for top offenders
+  offender_windows: ["last_month", "last_3_months"]

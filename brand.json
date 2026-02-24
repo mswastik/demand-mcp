@@ -1,0 +1,45 @@
+{
+  "_comment": "Stryker brand defaults. Edit colors, fonts, and logo_path to match your organization.",
+  "company_name": "Stryker",
+  "logo_path": "",
+  "colors": {
+    "primary": "#F4A11D",
+    "primary_dark": "#C07D00",
+    "secondary": "#003087",
+    "background": "#FFFFFF",
+    "surface": "#F5F5F5",
+    "text_primary": "#1A1A1A",
+    "text_secondary": "#555555",
+    "text_on_primary": "#FFFFFF",
+    "positive": "#2E7D32",
+    "negative": "#C62828",
+    "neutral": "#455A64",
+    "chart_palette": [
+      "#F4A11D",
+      "#003087",
+      "#2E7D32",
+      "#C62828",
+      "#7B1FA2",
+      "#00838F",
+      "#E64A19",
+      "#37474F"
+    ],
+    "df_color": "#F4A11D",
+    "stat_color": "#003087",
+    "actual_color": "#2E7D32"
+  },
+  "fonts": {
+    "heading": "Calibri, Arial, sans-serif",
+    "body": "Calibri, Arial, sans-serif",
+    "mono": "Consolas, 'Courier New', monospace",
+    "heading_size_title": "2.2rem",
+    "heading_size_h2": "1.5rem",
+    "heading_size_h3": "1.1rem",
+    "body_size": "0.9rem"
+  },
+  "presentation": {
+    "slide_transition": "slide",
+    "chart_height_px": 380,
+    "table_max_rows_per_slide": 15
+  }
+}
