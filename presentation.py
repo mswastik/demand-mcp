@@ -86,6 +86,7 @@ class PresentationBuilder:
         self.title = "Demand Planning Review"
         self.subtitle = ""
         self.created_at = datetime.now()
+        self._auto_filename: str | None = None  # locked on first auto_save call
 
     def initialize(self, title: str, subtitle: str = "") -> None:
         self.title = title
@@ -94,6 +95,20 @@ class PresentationBuilder:
 
     def add_slide(self, slide: Slide) -> None:
         self.slides.append(slide)
+
+    def auto_save(self) -> Path | None:
+        """Write HTML + sidecar state JSON after every slide mutation.
+
+        The filename is locked on the first call so subsequent saves
+        overwrite the same file.  Returns the output path, or None if
+        there are no slides yet.
+        """
+        if not self.slides:
+            return None
+        if self._auto_filename is None:
+            ts = self.created_at.strftime("%Y%m%d_%H%M%S")
+            self._auto_filename = f"demand_review_{ts}.html"
+        return self.finalize(filename=self._auto_filename)
 
     def add_commentary_by_id(self, slide_id: str, commentary: str) -> Slide | None:
         """Find a slide by slide_id and update its commentary. Returns the slide or None."""
@@ -149,7 +164,9 @@ class PresentationBuilder:
 
         All slides (with their original slide_ids) are reconstructed so
         the caller can immediately call add_slide / add_commentary /
-        finalize as if the session had never ended.
+        finalize as if the session had never ended.  The _auto_filename is
+        restored to the original HTML filename so auto_save() overwrites
+        the same file.
         """
         state_path = Path(state_path)
         raw = json.loads(state_path.read_text(encoding="utf-8"))
@@ -157,6 +174,7 @@ class PresentationBuilder:
         builder = cls(brand=brand, output_dir=output_dir)
         builder.title = raw.get("title", "Demand Planning Review")
         builder.subtitle = raw.get("subtitle", "")
+        builder._auto_filename = raw.get("html_filename")  # preserve original filename
         try:
             builder.created_at = datetime.fromisoformat(raw["created_at"])
         except Exception:

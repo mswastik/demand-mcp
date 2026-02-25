@@ -202,20 +202,36 @@ def generate_standard_report(
 # ── Layer computation helpers ────────────────────────────────────────────────
 
 def _by_forecast_level(df_base: pl.DataFrame, window: str) -> list[dict]:
-    """Layer 1 — Forecast Level / Region rollup."""
+    """Layer 1 — Forecast Level / Region rollup.
+
+    Pre-aggregates at (Forecast Level, CatalogNumber, SALES_DATE) grain first
+    so abs errors are computed on correctly-summed actuals/forecasts.
+    """
     df_w = filter_date_window(df_base, window) if window else df_base
     if df_w.is_empty():
         return []
 
     from metrics import _abs_error_cols, _aggregate_metrics, _compute_derived_metrics
-    df_w = _abs_error_cols(df_w)
-    agg = _aggregate_metrics(df_w, [FORECAST_LEVEL_COL])
+    from data import ACT_VOL, LAG_DF_COLS, LAG_STAT_COLS, ALL_LAGS
+
+    pre_group_cols = [FORECAST_LEVEL_COL, "CatalogNumber", "SALES_DATE"]
+    pre_group_cols = [c for c in pre_group_cols if c in df_w.columns]
+    vol_cols = [ACT_VOL] + [v for lag in ALL_LAGS for _, v in [LAG_DF_COLS[lag], LAG_STAT_COLS[lag]]]
+    vol_cols = [c for c in vol_cols if c in df_w.columns]
+    df_pre = df_w.group_by(pre_group_cols).agg([pl.col(c).sum() for c in vol_cols])
+
+    df_pre = _abs_error_cols(df_pre)
+    agg = _aggregate_metrics(df_pre, [FORECAST_LEVEL_COL])
     result = _compute_derived_metrics(agg)
     return _df_to_compact(result, FORECAST_LEVEL_COL, "L2", max_rows=20)
 
 
 def _by_level(df_base: pl.DataFrame, window: str, col: str) -> list[dict]:
-    """Generic: aggregate metrics at any single hierarchy column."""
+    """Generic: aggregate metrics at any single hierarchy column.
+
+    Pre-aggregates at (Forecast Level, CatalogNumber, SALES_DATE) grain first
+    so abs errors are computed on correctly-summed actuals/forecasts.
+    """
     if col not in df_base.columns:
         return []
 
@@ -224,8 +240,16 @@ def _by_level(df_base: pl.DataFrame, window: str, col: str) -> list[dict]:
         return []
 
     from metrics import _abs_error_cols, _aggregate_metrics, _compute_derived_metrics
-    df_w = _abs_error_cols(df_w)
-    agg = _aggregate_metrics(df_w, [col])
+    from data import ACT_VOL, LAG_DF_COLS, LAG_STAT_COLS, ALL_LAGS, FORECAST_LEVEL_COL
+
+    pre_group_cols = [FORECAST_LEVEL_COL, "CatalogNumber", "SALES_DATE"]
+    pre_group_cols = [c for c in pre_group_cols if c in df_w.columns]
+    vol_cols = [ACT_VOL] + [v for lag in ALL_LAGS for _, v in [LAG_DF_COLS[lag], LAG_STAT_COLS[lag]]]
+    vol_cols = [c for c in vol_cols if c in df_w.columns]
+    df_pre = df_w.group_by(pre_group_cols).agg([pl.col(c).sum() for c in vol_cols])
+
+    df_pre = _abs_error_cols(df_pre)
+    agg = _aggregate_metrics(df_pre, [col])
     result = _compute_derived_metrics(agg)
     return _df_to_compact(result, col, "L2", max_rows=15)
 
@@ -234,6 +258,9 @@ def _root_cause_hints(df_base: pl.DataFrame, window: str) -> list[dict]:
     """
     Top 5 worst rows at the finest available grain (CatalogNumber, falling
     back to IBP Level 7, IBP Level 6), annotated with their parent Product Line.
+
+    Pre-aggregates at (Forecast Level, CatalogNumber, SALES_DATE) — or the
+    finest grain equivalent — before computing abs errors.
     """
     df_w = filter_date_window(df_base, window) if window else df_base
     if df_w.is_empty():
@@ -249,11 +276,23 @@ def _root_cause_hints(df_base: pl.DataFrame, window: str) -> list[dict]:
 
     # Determine which parent context cols are available
     parent_cols = [c for c in ["Product Line", "IBP Level 5", "Franchise"] if c in df_w.columns]
-    group_cols = parent_cols + [finest]
+    # group_cols for the final output  (no SALES_DATE — sum across all months in window)
+    output_group_cols = parent_cols + [finest]
+    # pre-aggregation grain also includes SALES_DATE and Forecast Level
+    pre_group_cols = [c for c in [FORECAST_LEVEL_COL, "SALES_DATE"] + output_group_cols if c in df_w.columns]
+    # deduplicate preserving order
+    seen = set()
+    pre_group_cols = [c for c in pre_group_cols if not (c in seen or seen.add(c))]
 
     from metrics import _abs_error_cols, _aggregate_metrics, _compute_derived_metrics
-    df_w = _abs_error_cols(df_w)
-    agg = _aggregate_metrics(df_w, group_cols)
+    from data import ACT_VOL, LAG_DF_COLS, LAG_STAT_COLS, ALL_LAGS
+
+    vol_cols = [ACT_VOL] + [v for lag in ALL_LAGS for _, v in [LAG_DF_COLS[lag], LAG_STAT_COLS[lag]]]
+    vol_cols = [c for c in vol_cols if c in df_w.columns]
+    df_pre = df_w.group_by(pre_group_cols).agg([pl.col(c).sum() for c in vol_cols])
+
+    df_pre = _abs_error_cols(df_pre)
+    agg = _aggregate_metrics(df_pre, output_group_cols)
     result = _compute_derived_metrics(agg)
 
     sort_col = "L2 DF Sum Abs Err"
@@ -262,7 +301,7 @@ def _root_cause_hints(df_base: pl.DataFrame, window: str) -> list[dict]:
 
     hints = []
     for row in result.head(5).iter_rows(named=True):
-        entry = {c: row.get(c) for c in group_cols}
+        entry = {c: row.get(c) for c in output_group_cols}
         entry.update(_metric_row(row, "L2"))
         hints.append(entry)
     return hints
@@ -272,14 +311,28 @@ def _trend(df_base: pl.DataFrame) -> dict:
     """
     12-month monthly L2 DF & Stat accuracy as parallel arrays.
     Compact: returns {months, df_acc, stat_acc} not a list of dicts.
+
+    Pre-aggregates at (Forecast Level, CatalogNumber, SALES_DATE) grain before
+    computing abs errors so the accuracy formula matches the reference:
+      Accuracy = 1 - Sum(Abs Err per SKU-month) / Sum(Act Vol per SKU-month)
     """
     df_w = filter_date_window(df_base, "last_12_months")
     if df_w.is_empty():
         return {"months": [], "df_acc": [], "stat_acc": []}
 
     from metrics import _abs_error_cols, _aggregate_metrics, _compute_derived_metrics
-    df_w = _abs_error_cols(df_w)
-    agg = _aggregate_metrics(df_w, ["SALES_DATE"])
+    from data import ACT_VOL, LAG_DF_COLS, LAG_STAT_COLS, ALL_LAGS, FORECAST_LEVEL_COL
+
+    # Step 1: sum all volume columns at the (Forecast Level, CatalogNumber, SALES_DATE) grain
+    pre_group_cols = [FORECAST_LEVEL_COL, "CatalogNumber", "SALES_DATE"]
+    pre_group_cols = [c for c in pre_group_cols if c in df_w.columns]
+    vol_cols = [ACT_VOL] + [v for lag in ALL_LAGS for _, v in [LAG_DF_COLS[lag], LAG_STAT_COLS[lag]]]
+    vol_cols = [c for c in vol_cols if c in df_w.columns]
+    df_pre = df_w.group_by(pre_group_cols).agg([pl.col(c).sum() for c in vol_cols])
+
+    # Step 2: compute abs errors then aggregate by SALES_DATE only
+    df_pre = _abs_error_cols(df_pre)
+    agg = _aggregate_metrics(df_pre, ["SALES_DATE"])
     result = _compute_derived_metrics(agg).sort("SALES_DATE")
 
     months = [str(d)[:7] for d in result["SALES_DATE"].to_list()]
@@ -375,7 +428,20 @@ def compute_drill_down(
         )
 
     from metrics import _abs_error_cols, _aggregate_metrics, _compute_derived_metrics
-    df_err = _abs_error_cols(df_base)
+    from data import ACT_VOL, LAG_DF_COLS, LAG_STAT_COLS, ALL_LAGS, FORECAST_LEVEL_COL as _FL
+
+    # Pre-aggregate at (Forecast Level, CatalogNumber, SALES_DATE) grain so
+    # abs errors are computed on correctly-summed actuals/forecasts.
+    pre_group_cols = [_FL, "CatalogNumber", "SALES_DATE", drill_level]
+    pre_group_cols = [c for c in pre_group_cols if c in df_base.columns]
+    # deduplicate preserving order
+    seen: set = set()
+    pre_group_cols = [c for c in pre_group_cols if not (c in seen or seen.add(c))]
+    vol_cols = [ACT_VOL] + [v for lag in ALL_LAGS for _, v in [LAG_DF_COLS[lag], LAG_STAT_COLS[lag]]]
+    vol_cols = [c for c in vol_cols if c in df_base.columns]
+    df_pre = df_base.group_by(pre_group_cols).agg([pl.col(c).sum() for c in vol_cols])
+
+    df_err = _abs_error_cols(df_pre)
     agg = _aggregate_metrics(df_err, [drill_level])
     result = _compute_derived_metrics(agg)
 
@@ -529,11 +595,24 @@ def _drill_slide_data(rows: list[dict], drill_level: str, metric: str, df: pl.Da
 
 
 def _trend_for_drill(df: pl.DataFrame) -> dict:
-    """Helper: monthly accuracy trend for an already-filtered DataFrame."""
+    """Helper: monthly accuracy trend for an already-filtered DataFrame.
+
+    Pre-aggregates at (Forecast Level, CatalogNumber, SALES_DATE) grain before
+    computing abs errors so the accuracy formula matches the reference.
+    """
     from metrics import _abs_error_cols, _aggregate_metrics, _compute_derived_metrics
+    from data import ACT_VOL, LAG_DF_COLS, LAG_STAT_COLS, ALL_LAGS, FORECAST_LEVEL_COL
     if df.is_empty():
         return {"months": [], "df_acc_pct": [], "stat_acc_pct": []}
-    df_err = _abs_error_cols(df)
+
+    # Pre-aggregate at the correct grain before abs error computation
+    pre_group_cols = [FORECAST_LEVEL_COL, "CatalogNumber", "SALES_DATE"]
+    pre_group_cols = [c for c in pre_group_cols if c in df.columns]
+    vol_cols = [ACT_VOL] + [v for lag in ALL_LAGS for _, v in [LAG_DF_COLS[lag], LAG_STAT_COLS[lag]]]
+    vol_cols = [c for c in vol_cols if c in df.columns]
+    df_pre = df.group_by(pre_group_cols).agg([pl.col(c).sum() for c in vol_cols])
+
+    df_err = _abs_error_cols(df_pre)
     agg = _aggregate_metrics(df_err, ["SALES_DATE"])
     result = _compute_derived_metrics(agg).sort("SALES_DATE")
     months = [str(d)[:7] for d in result["SALES_DATE"].to_list()]

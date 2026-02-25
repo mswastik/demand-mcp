@@ -270,6 +270,8 @@ def compute_forecast_evolution(
     if df.is_empty():
         return pl.DataFrame()
 
+    from data import ACT_VOL, LAG_DF_COLS, LAG_STAT_COLS, ALL_LAGS
+
     agg_exprs = [pl.col(ACT_VOL).sum().alias("Sum Act Vol")]
     for lag in ALL_LAGS:
         _, df_vol = LAG_DF_COLS[lag]
@@ -280,6 +282,75 @@ def compute_forecast_evolution(
         ]
 
     return df.group_by("SALES_DATE").agg(agg_exprs).sort("SALES_DATE")
+    
+def compute_forecast_evolution_accuracy(
+    df_raw: pl.DataFrame,
+    filters: dict | None = None,
+    window: str | None = None,
+) -> pl.DataFrame:
+    """
+    Show how accuracy changed across lags (L2 → L1 → L0) per month.
+    Follows the portfolio accuracy formula: 1 - Sum(Abs Err) / Sum(Act Vol).
+    """
+    df = filter_to_actuals_period(df_raw)
+    if filters:
+        df = apply_filters(df, filters)
+    if window:
+        df = filter_date_window(df, window)
+    if df.is_empty():
+        return pl.DataFrame()
+
+    from data import LAG_DF_COLS, LAG_STAT_COLS, ALL_LAGS, FORECAST_LEVEL_COL
+
+    # 1. Pre-aggregate at SKU-month grain
+    group_cols = [FORECAST_LEVEL_COL, "CatalogNumber", "SALES_DATE"]
+    group_cols = [c for c in group_cols if c in df.columns]
+    vol_cols = [ACT_VOL]
+    for lag in ALL_LAGS:
+        vol_cols.append(LAG_DF_COLS[lag][1])
+        vol_cols.append(LAG_STAT_COLS[lag][1])
+
+    df_pre = df.group_by(group_cols).agg([pl.col(c).sum() for c in vol_cols])
+
+    # 2. Compute absolute errors for all lags
+    for lag in ALL_LAGS:
+        act = pl.col(ACT_VOL)
+        df_fcst = pl.col(LAG_DF_COLS[lag][1])
+        stat_fcst = pl.col(LAG_STAT_COLS[lag][1])
+
+        df_pre = df_pre.with_columns([
+            (act - df_fcst).abs().alias(f"{lag} DF Abs Err"),
+            (act - stat_fcst).abs().alias(f"{lag} Stat Abs Err"),
+        ])
+
+    # 3. Sum everything by SALES_DATE
+    agg_exprs = [pl.col(ACT_VOL).sum().alias("Sum Act Vol")]
+    for lag in ALL_LAGS:
+        agg_exprs += [
+            pl.col(f"{lag} DF Abs Err").sum().alias(f"{lag} DF Sum Abs Err"),
+            pl.col(f"{lag} Stat Abs Err").sum().alias(f"{lag} Stat Sum Abs Err"),
+        ]
+
+    res = df_pre.group_by("SALES_DATE").agg(agg_exprs).sort("SALES_DATE")
+
+    # 4. Compute Accuracy Ratios
+    for lag in ALL_LAGS:
+        act = pl.col("Sum Act Vol")
+        # Safe division: null if act is 0
+        safe_act = pl.when(act == 0.0).then(None).otherwise(act)
+
+        res = res.with_columns([
+            (1 - pl.col(f"{lag} DF Sum Abs Err") / safe_act).clip(-1.0, 1.0).alias(f"{lag} DF Acc"),
+            (1 - pl.col(f"{lag} Stat Sum Abs Err") / safe_act).clip(-1.0, 1.0).alias(f"{lag} Stat Acc"),
+        ])
+
+    # Return only the useful columns
+    final_cols = ["SALES_DATE", "Sum Act Vol"]
+    for lag in ["L2", "L1", "L0"]:  # Focus on the historical lags
+        if f"{lag} DF Acc" in res.columns:
+            final_cols.extend([f"{lag} DF Acc", f"{lag} Stat Acc"])
+
+    return res.select(final_cols)
 
 
 def get_top_offenders(

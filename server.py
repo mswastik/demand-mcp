@@ -18,22 +18,21 @@ Tools exposed:
         7.  get_accuracy_trend
         8.  get_yoy_growth
         9.  get_forecast_evolution
-        10. get_top_offenders
+        10. get_forecast_evolution_accuracy — accuracy % across lags (L2→L1→L0)
+        11. get_top_offenders
 
-    Presentation (new / edit session):
-        11. initialize_presentation   — start a blank new presentation
-        12. add_slide                  — append a slide to the current session
-        13. finalize_presentation      — write HTML + sidecar .state.json
-
-    Efficient report generation:
-        14. generate_standard_report  — pre-compute all standard slides in one call
-        15. add_commentary            — LLM writes text to a named slide
-        16. get_presentation_status   — list slide IDs + commentary state (resume support)
-        17. drill_down_slide          — append one drill-down slide at any hierarchy level
+    Presentation:
+        12. generate_standard_report  — auto-initialises a new presentation, builds
+                                        standard slides, returns compact briefing JSON.
+                                        HTML is saved automatically after each mutation.
+        13. add_slide                  — append a custom slide; auto-saves HTML.
+        14. add_commentary            — write narrative for a named slide; auto-saves HTML.
+        15. get_presentation_status   — list slide IDs + commentary status (resume support).
+        16. drill_down_slide          — append a drill-down slide; auto-saves HTML.
 
     Editing existing presentations:
-        18. list_presentations        — list saved HTML files; flags which are editable
-        19. load_presentation         — reload a saved presentation for editing
+        17. list_presentations        — list saved HTML files; flags which are editable.
+        18. load_presentation         — reload a saved presentation for editing.
 """
 
 from __future__ import annotations
@@ -545,7 +544,42 @@ def get_forecast_evolution(
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# TOOL 10 — get_top_offenders
+# TOOL 10 — get_forecast_evolution_accuracy
+# ════════════════════════════════════════════════════════════════════════════
+
+@mcp.tool()
+def get_forecast_evolution_accuracy(
+    filters: Optional[dict] = None,
+    window: Optional[str] = None,
+) -> dict:
+    """
+    Show how forecast accuracy developed across lags (L2 → L1 → L0) per month.
+
+    Use this to see if our forecast accuracy improved as we got closer to
+    the period (i.e., is L0 more accurate than L2?).
+
+    Parameters
+    ----------
+    filters : optional {col: value} filters to scope to a product/location
+    window  : time window string
+
+    Returns
+    -------
+    Table with one row per SALES_DATE showing Sum Act Vol and lag accuracies.
+    """
+    ds = _get_ds()
+    from metrics import compute_forecast_evolution_accuracy
+
+    result = compute_forecast_evolution_accuracy(
+        df_raw=ds.df,
+        filters=filters,
+        window=window,
+    )
+    return _df_to_dict(result)
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# TOOL 11 — get_top_offenders
 # ════════════════════════════════════════════════════════════════════════════
 
 @mcp.tool()
@@ -602,46 +636,7 @@ def get_top_offenders(
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# TOOL 11 — initialize_presentation
-# ════════════════════════════════════════════════════════════════════════════
-
-@mcp.tool()
-def initialize_presentation(
-    title: str,
-    subtitle: str = "",
-) -> dict:
-    """
-    Start a new HTML presentation session. Must be called before add_slide.
-    Resets any in-progress presentation.
-
-    Parameters
-    ----------
-    title    : Main title shown on the cover slide
-    subtitle : Optional subtitle (e.g. period covered, scope)
-
-    Returns
-    -------
-    Confirmation with output directory path.
-    """
-    state = _get_state()
-    from presentation import PresentationBuilder
-
-    state.presentation = PresentationBuilder(
-        brand=state.brand,
-        output_dir=state.config.get("output_dir", "output"),
-    )
-    state.presentation.initialize(title=title, subtitle=subtitle)
-
-    return {
-        "status": "initialized",
-        "title": title,
-        "subtitle": subtitle,
-        "output_dir": str(state.presentation.output_dir),
-    }
-
-
-# ════════════════════════════════════════════════════════════════════════════
-# TOOL 12 — add_slide
+# TOOL 11 — add_slide
 # ════════════════════════════════════════════════════════════════════════════
 
 @mcp.tool()
@@ -655,7 +650,10 @@ def add_slide(
     chart2: Optional[dict] = None,
 ) -> dict:
     """
-    Add a slide to the current presentation.
+    Add a slide to the current presentation and auto-save the HTML file.
+
+    Call generate_standard_report() first (it auto-initialises the presentation).
+    Use this tool for custom slides beyond the standard set.
 
     Layouts
     -------
@@ -677,7 +675,7 @@ def add_slide(
       "y_data": [...] or {"Series A": [...], "Series B": [...]},
       "x_label": "Month",
       "y_label": "Volume",
-      "colors": ["#hex1", "#hex2"],   // optional, uses brand palette by default
+      "colors": ["#hex1", "#hex2"],
       "show_legend": true,
       "height": 380
     }
@@ -687,36 +685,26 @@ def add_slide(
     {
       "headers": ["Col1", "Col2", ...],
       "rows": [[val1, val2, ...], ...],
-      "highlight_col": 2,              // optional column index to color-code
-      "highlight_thresholds": [60, 80] // optional [low%, high%] for red/green
+      "highlight_col": 2,
+      "highlight_thresholds": [60, 80]
     }
-
-    Commentary
-    ----------
-    Plain text or HTML fragments (bullet list, bold text, etc.).
-    For "metrics" layout, pass JSON array as described above.
-
-    Parameters
-    ----------
-    layout     : slide layout string (see above)
-    title      : slide header title
-    subtitle   : optional subtitle (used in title layout)
-    commentary : text, HTML, or JSON string depending on layout
-    chart      : chart spec dict
-    table      : table spec dict
-    chart2     : second chart spec dict (for two_col layout)
 
     Returns
     -------
-    Slide index and confirmation.
+    Slide index, confirmation, and output_path of the auto-saved HTML file.
     """
     state = _get_state()
     if state.presentation is None:
-        return {"error": "No presentation initialized. Call initialize_presentation first."}
+        return {
+            "error": (
+                "No presentation active. Call generate_standard_report() first "
+                "to auto-initialise a presentation, or load_presentation() to "
+                "resume an existing one."
+            )
+        }
 
     from presentation import Slide, ChartSpec, TableSpec
 
-    # Build ChartSpec
     def _make_chart(c: dict | None) -> ChartSpec | None:
         if not c:
             return None
@@ -752,82 +740,56 @@ def add_slide(
         chart2=_make_chart(chart2),
     )
     state.presentation.add_slide(slide)
+    out_path = state.presentation.auto_save()
 
     return {
         "status": "slide_added",
         "slide_index": len(state.presentation.slides) - 1,
         "layout": layout,
         "title": title,
+        "output_path": str(out_path) if out_path else None,
     }
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# TOOL 13 — finalize_presentation
-# ════════════════════════════════════════════════════════════════════════════
-
-@mcp.tool()
-def finalize_presentation(filename: Optional[str] = None) -> dict:
-    """
-    Write the presentation to an HTML file and return the output path.
-
-    Must be called after initialize_presentation and one or more add_slide calls.
-
-    Parameters
-    ----------
-    filename : optional output filename (default: demand_review_YYYYMMDD_HHMMSS.html)
-
-    Returns
-    -------
-    Output file path and slide count.
-    """
-    state = _get_state()
-    if state.presentation is None:
-        return {"error": "No presentation initialized. Call initialize_presentation first."}
-
-    slide_count = len(state.presentation.slides)
-    if slide_count == 0:
-        return {"error": "No slides added yet. Call add_slide at least once."}
-
-    out_path = state.presentation.finalize(filename=filename)
-
-    return {
-        "status": "complete",
-        "output_path": str(out_path),
-        "slide_count": slide_count,
-        "file_size_kb": round(out_path.stat().st_size / 1024, 1),
-    }
-
-
-# ════════════════════════════════════════════════════════════════════════════
-# TOOL 14 — generate_standard_report
+# TOOL 12 — generate_standard_report
 # ════════════════════════════════════════════════════════════════════════════
 
 @mcp.tool()
 def generate_standard_report(
+    title: str = "Demand Planning Review",
+    subtitle: str = "",
     window: str = "last_3_months",
     filters: Optional[dict] = None,
 ) -> dict:
     """
-    *** START HERE for presentation creation. ***
+    *** START HERE for every new presentation. ***
 
-    Pre-computes all standard metrics at multiple hierarchy levels, builds 9
-    standard slides automatically (cover, KPI summary, accuracy trend, Forecast
-    Level table, Product Line table, IBP Level 5 table, bias chart, FVA chart,
-    YoY growth chart), and returns a compact layered briefing JSON (~700 tokens).
+    Auto-initialises a fresh presentation (no need to call initialize_presentation),
+    pre-computes all standard metrics at multiple hierarchy levels, builds standard
+    slides automatically (cover, KPI summary, accuracy trend, Forecast Level table,
+    Product Line table, IBP Level 5 table, bias chart, FVA chart, YoY growth chart),
+    and returns a compact briefing JSON (~700 tokens) for the LLM to write commentary.
 
-    The LLM should:
-      1. Call generate_standard_report() — slides are built, briefing returned.
-      2. Read the briefing and write commentary for each slide with add_commentary().
-      3. Optionally call drill_down_slide() for anomalies worth investigating.
-      4. Call finalize_presentation() to write the HTML file.
+    The HTML file is written automatically and updated after every subsequent
+    add_commentary() or drill_down_slide() call — no finalize step needed.
+
+    Workflow
+    --------
+      1. Call generate_standard_report()    — slides built, briefing returned.
+      2. Call add_commentary(slide_id, ...) — write narrative for each slide.
+      3. Optionally call drill_down_slide() — for anomalies worth investigating.
+      (HTML is saved automatically after steps 2 and 3.)
 
     Parameters
     ----------
-    window  : time window — 'last_month', 'last_3_months', 'last_12_months',
-              'ytd', or 'YYYY-MM:YYYY-MM'. Default: last_3_months.
-    filters : optional {col: value} to scope to a Franchise, Product Line, etc.
-              e.g. {"Franchise": "Trauma"}
-              Omit for a full-portfolio report.
+    title    : Presentation title shown on the cover slide.
+               Default: 'Demand Planning Review'.
+    subtitle : Optional subtitle (e.g. period or team name).
+    window   : Time window — 'last_month', 'last_3_months', 'last_12_months',
+               'ytd', or 'YYYY-MM:YYYY-MM'. Default: last_3_months.
+    filters  : Optional {col: value} to scope to a Franchise, Product Line, etc.
+               e.g. {"Franchise": "Trauma"}. Omit for a full-portfolio report.
 
     Returns
     -------
@@ -840,65 +802,70 @@ def generate_standard_report(
         trend              — {months, df_acc, stat_acc} arrays for 12-month chart
         yoy                — [{year, act_vol, yoy_pct}, ...] last 3 years
         slides_created     — list of {slide_id, title} for slides just built
+        output_path        — path of the auto-saved HTML file
     """
     state = _get_state()
-    if state.presentation is None:
-        return {
-            "error": (
-                "No presentation initialized. "
-                "Call initialize_presentation(title, subtitle) first, then call this tool."
-            )
-        }
-
+    from presentation import PresentationBuilder
     from briefing import generate_standard_report as _briefing, build_standard_slides
+
+    # Auto-initialise (or reset) the presentation — no separate tool call needed.
+    state.presentation = PresentationBuilder(
+        brand=state.brand,
+        output_dir=state.config.get("output_dir", "output"),
+    )
+    state.presentation.initialize(title=title, subtitle=subtitle)
 
     ds = _get_ds()
     briefing = _briefing(ds, window=window, filters=filters)
     build_standard_slides(briefing, state.presentation)
 
-    # Append a compact slides_created list to the briefing so the LLM knows
-    # what to write commentary for without needing to call get_presentation_status()
+    # Auto-save HTML + state JSON after building standard slides.
+    out_path = state.presentation.auto_save()
+
     briefing["slides_created"] = [
         {"slide_id": s["slide_id"], "title": s["title"]}
         for s in state.presentation.status()
     ]
+    briefing["output_path"] = str(out_path) if out_path else None
 
     return briefing
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# TOOL 15 — add_commentary
+# TOOL 13 — add_commentary
 # ════════════════════════════════════════════════════════════════════════════
 
 @mcp.tool()
 def add_commentary(slide_id: str, commentary: str) -> dict:
     """
-    Add or update the commentary text on a specific slide.
+    Add or update the commentary text on a specific slide, then auto-save the HTML.
 
     Call this after generate_standard_report() to write narrative for each slide.
-    The LLM should write 2-4 bullet points or sentences per slide based on the
-    briefing data returned by generate_standard_report().
+    Write 2-4 bullet points or sentences per slide based on the briefing data.
 
     Parameters
     ----------
-    slide_id   : 8-char or named slide ID from get_presentation_status() or
+    slide_id   : Named or 8-char slide ID from get_presentation_status() or
                  slides_created in generate_standard_report() response.
-                 Standard slide IDs: 'cover', 'kpi_summary', 'accuracy_trend',
+                 Standard IDs: 'cover', 'kpi_summary', 'accuracy_trend',
                  'by_forecast_level', 'by_product_line', 'by_ibp5',
                  'bias_summary', 'fva_summary', 'yoy_growth'.
-    commentary : Text to display in the commentary box. Supports plain text and
-                 HTML fragments, e.g.:
+    commentary : Text for the commentary box. Supports plain text and HTML:
                  '<ul><li>Point 1</li><li>Point 2</li></ul>'
-                 For bullet lists: '<ul><li>...</li></ul>'
-                 For bold text: '<strong>key term</strong>'
+                 '<strong>key term</strong>'
 
     Returns
     -------
-    {status, slide_id, title} or {error} if slide_id not found.
+    {status, slide_id, title, output_path} or {error} if slide_id not found.
     """
     state = _get_state()
     if state.presentation is None:
-        return {"error": "No presentation initialized. Call initialize_presentation first."}
+        return {
+            "error": (
+                "No presentation active. Call generate_standard_report() first "
+                "or load_presentation() to resume an existing one."
+            )
+        }
 
     slide = state.presentation.add_commentary_by_id(slide_id, commentary)
     if slide is None:
@@ -908,21 +875,23 @@ def add_commentary(slide_id: str, commentary: str) -> dict:
             "available_slide_ids": available,
         }
 
+    out_path = state.presentation.auto_save()
     return {
         "status": "commentary_added",
         "slide_id": slide.slide_id,
         "title": slide.title,
+        "output_path": str(out_path) if out_path else None,
     }
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# TOOL 16 — get_presentation_status
+# TOOL 14 — get_presentation_status
 # ════════════════════════════════════════════════════════════════════════════
 
 @mcp.tool()
 def get_presentation_status() -> dict:
     """
-    Return the current state of all slides in the presentation.
+    Return the current state of all slides in the active presentation.
 
     Use this to:
     - See which slides already have commentary (has_commentary: true) vs. need it.
@@ -933,7 +902,9 @@ def get_presentation_status() -> dict:
     Returns
     -------
     {
+        "active": bool,              # false if no presentation is loaded
         "slide_count": int,
+        "output_path": str | null,   # current auto-save path
         "slides": [
             {
                 "slide_index": int,
@@ -944,23 +915,37 @@ def get_presentation_status() -> dict:
             },
             ...
         ],
-        "commentary_complete": bool  # true if all slides have commentary
+        "commentary_complete": bool
     }
     """
     state = _get_state()
     if state.presentation is None:
-        return {"error": "No presentation initialized. Call initialize_presentation first."}
+        return {
+            "active": False,
+            "slide_count": 0,
+            "output_path": None,
+            "slides": [],
+            "commentary_complete": False,
+            "hint": "Call generate_standard_report() to start a new presentation.",
+        }
 
     slides = state.presentation.status()
+    out_path = None
+    if state.presentation._auto_filename:
+        candidate = state.presentation.output_dir / state.presentation._auto_filename
+        out_path = str(candidate) if candidate.exists() else None
+
     return {
+        "active": True,
         "slide_count": len(slides),
+        "output_path": out_path,
         "slides": slides,
         "commentary_complete": all(s["has_commentary"] for s in slides) if slides else False,
     }
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# TOOL 17 — drill_down_slide
+# TOOL 15 — drill_down_slide
 # ════════════════════════════════════════════════════════════════════════════
 
 @mcp.tool()
@@ -972,9 +957,9 @@ def drill_down_slide(
     filters: Optional[dict] = None,
 ) -> dict:
     """
-    Append a focused drill-down slide for any product or location hierarchy node.
+    Append a focused drill-down slide, then auto-save the HTML.
 
-    This tool automatically resolves the NEXT level down in the hierarchy and
+    Automatically resolves the NEXT level down in the hierarchy and
     computes a metric table at that level, scoped to the parent node.
 
     Hierarchy drill paths
@@ -985,35 +970,33 @@ def drill_down_slide(
 
     Parameters
     ----------
-    hierarchy_col   : The column of the PARENT node you are drilling from.
-                      e.g. 'Franchise', 'Product Line', 'IBP Level 5',
-                           'Forecast Level', 'Region'
-    hierarchy_value : The value to scope to at hierarchy_col level.
-                      e.g. 'Trauma', 'Trauma Nails', 'APAC'
-    metric          : What to analyse at the next level down:
-                      'accuracy'     — grouped bar: DF vs Stat accuracy %
-                      'bias'         — bar: DF bias %
-                      'fva'          — bar: Forecast Value Add %
-                      'trend'        — line: monthly accuracy trend
-                      'top_offenders'— table: worst performers ranked by abs error
+    hierarchy_col   : The PARENT column to drill from.
+                      e.g. 'Franchise', 'Product Line', 'Forecast Level'
+    hierarchy_value : The value to scope to, e.g. 'Trauma', 'APAC'
+    metric          : 'accuracy' | 'bias' | 'fva' | 'trend' | 'top_offenders'
     window          : time window string (default: last_3_months)
-    filters         : optional additional filters, e.g. {"Region": "APAC"}
-                      Combined with hierarchy_col=hierarchy_value filter.
+    filters         : optional additional {col: value} filters
 
     Returns
     -------
     {
         "slide_id"        : str    — use with add_commentary()
-        "title"           : str
-        "drill_level"     : str    — the column drilled INTO (next level)
-        "parent_col"      : str
-        "parent_value"    : str
-        "briefing_summary": list   — compact rows for LLM commentary (~200 tokens)
+        "title"           : str,
+        "drill_level"     : str,
+        "parent_col"      : str,
+        "parent_value"    : str,
+        "briefing_summary": list,   — compact rows for commentary
+        "output_path"     : str     — path of the auto-saved HTML
     }
     """
     state = _get_state()
     if state.presentation is None:
-        return {"error": "No presentation initialized. Call initialize_presentation first."}
+        return {
+            "error": (
+                "No presentation active. Call generate_standard_report() first "
+                "or load_presentation() to resume an existing one."
+            )
+        }
 
     from briefing import compute_drill_down
     from presentation import Slide, ChartSpec, TableSpec
@@ -1040,7 +1023,6 @@ def drill_down_slide(
     layout = slide_data["layout"]
     title = f"{metric.title()}: {hierarchy_value} → {drill_level}"
 
-    # Build ChartSpec / TableSpec from slide_data
     def _cs(c):
         if not c:
             return None
@@ -1072,6 +1054,7 @@ def drill_down_slide(
         table=_ts(slide_data.get("table_spec")),
     )
     state.presentation.add_slide(slide)
+    out_path = state.presentation.auto_save()
 
     return {
         "status": "slide_added",
@@ -1081,11 +1064,12 @@ def drill_down_slide(
         "parent_col": hierarchy_col,
         "parent_value": hierarchy_value,
         "briefing_summary": result["rows"],
+        "output_path": str(out_path) if out_path else None,
     }
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# TOOL 18 — list_presentations
+# TOOL 16 — list_presentations
 # ════════════════════════════════════════════════════════════════════════════
 
 @mcp.tool()
@@ -1139,7 +1123,7 @@ def list_presentations() -> dict:
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# TOOL 19 — load_presentation
+# TOOL 17 — load_presentation
 # ════════════════════════════════════════════════════════════════════════════
 
 @mcp.tool()
@@ -1147,14 +1131,13 @@ def load_presentation(filename: str) -> dict:
     """
     Load an existing presentation for editing.
 
-    Reads the sidecar .state.json that was written by finalize_presentation()
-    and restores the full in-memory session (all slides with their original
-    slide_ids). After calling this tool you can:
-      • add_commentary(slide_id, ...)   — update/add commentary to any slide
-      • add_slide(...)                  — append new slides
-      • drill_down_slide(...)           — append drill-down slides
+    Reads the sidecar .state.json written alongside the HTML file and restores
+    the full in-memory session (all slides with their original slide_ids).
+    After calling this tool you can:
+      • add_commentary(slide_id, ...)   — update/add commentary; auto-saves HTML
+      • add_slide(...)                  — append new slides; auto-saves HTML
+      • drill_down_slide(...)           — append drill-down slides; auto-saves HTML
       • get_presentation_status()       — see the full slide list
-      • finalize_presentation(filename) — overwrite the original file
 
     Parameters
     ----------
