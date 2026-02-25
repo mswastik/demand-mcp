@@ -107,7 +107,9 @@ for a slide — `generate_standard_report` already does all of that in one call.
 
 ## IMPORTANT CONSTRAINTS
 
-- Never hallucinate data. If a tool returns empty results, say so in commentary.
+- Never hallucinate or create synthetic data. If a tool returns empty results, say so in commentary.
+- Always call `finalize_presentation` after done adding commentaries and drill down slides.
+- Add commentaries only in the slide through `add_commentary` tool, do not provide commentaries in the chat.
 - Do not average row-level accuracy — the tools return correctly weighted aggregates.
 - The dataset only contains actuals up to the previous completed month.
 - `df_acc`, `stat_acc`, `bias_pct`, `fva` in the briefing are **decimal fractions**

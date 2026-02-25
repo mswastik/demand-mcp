@@ -180,7 +180,7 @@ class PresentationBuilder:
       margin: -0.5rem -1.5rem 1rem -1.5rem;
       padding: 0.5rem 1.5rem;
       font-family: var(--font-heading);
-      font-size: 1.1rem;
+      font-size: 1.6rem;
       font-weight: 600;
       display: flex; align-items: center; gap: 0.75rem;
     }}
@@ -409,6 +409,7 @@ class PresentationBuilder:
         return f"""<div class="slide-header">
   <div class="accent-bar"></div>
   {title}
+  <img style="margin-left:auto;" src="{self.brand.get('logo_path', '')}" alt="Logo">
 </div>"""
 
     def _footer(self) -> str:

@@ -1,7 +1,7 @@
 {
   "_comment": "Stryker brand defaults. Edit colors, fonts, and logo_path to match your organization.",
   "company_name": "Stryker",
-  "logo_path": "",
+  "logo_path": "logo.png",
   "colors": {
     "primary": "#F4A11D",
     "primary_dark": "#C07D00",
@@ -29,8 +29,8 @@
     "actual_color": "#2E7D32"
   },
   "fonts": {
-    "heading": "Calibri, Arial, sans-serif",
-    "body": "Calibri, Arial, sans-serif",
+    "heading": "Arial Black, Calibri, Arial, sans-serif",
+    "body": "Cambria, Calibri, Arial, sans-serif",
     "mono": "Consolas, 'Courier New', monospace",
     "heading_size_title": "2.2rem",
     "heading_size_h2": "1.5rem",
