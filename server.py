@@ -20,19 +20,20 @@ Tools exposed:
         9.  get_forecast_evolution
         10. get_forecast_evolution_accuracy — accuracy % across lags (L2→L1→L0)
         11. get_top_offenders
+        12. detect_anomalies_in_trend — identify statistical anomalies in metric trends
 
     Presentation:
-        12. generate_standard_report  — auto-initialises a new presentation, builds
+        13. generate_standard_report  — auto-initialises a new presentation, builds
                                         standard slides, returns compact briefing JSON.
                                         HTML is saved automatically after each mutation.
-        13. add_slide                  — append a custom slide; auto-saves HTML.
-        14. add_commentary            — write narrative for a named slide; auto-saves HTML.
-        15. get_presentation_status   — list slide IDs + commentary status (resume support).
-        16. drill_down_slide          — append a drill-down slide; auto-saves HTML.
+        14. add_slide                  — append a custom slide; auto-saves HTML.
+        15. add_commentary            — write narrative for a named slide; auto-saves HTML.
+        16. get_presentation_status   — list slide IDs + commentary status (resume support).
+        17. drill_down_slide          — append a drill-down slide; auto-saves HTML.
 
     Editing existing presentations:
-        17. list_presentations        — list saved HTML files; flags which are editable.
-        18. load_presentation         — reload a saved presentation for editing.
+        18. list_presentations        — list saved HTML files; flags which are editable.
+        19. load_presentation         — reload a saved presentation for editing.
 """
 
 from __future__ import annotations
@@ -636,7 +637,73 @@ def get_top_offenders(
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# TOOL 11 — add_slide
+# TOOL 12 — detect_anomalies_in_trend
+# ════════════════════════════════════════════════════════════════════════════
+
+@mcp.tool()
+def detect_anomalies_in_trend(
+    group_by: list[str],
+    metric: Literal["accuracy", "bias", "volume"] = "accuracy",
+    lag: str = "L2",
+    window: str = "last_12_months",
+    filters: Optional[dict] = None,
+    threshold_std: float = 2.0,
+) -> dict:
+    """
+    Detect statistical anomalies in metric trends over time.
+    
+    Uses rolling statistics (3-month rolling mean ± N standard deviations) to
+    identify months where the metric deviated significantly from the trend.
+    
+    Use this to find:
+    - Sudden drops in forecast accuracy that need investigation
+    - Unusual bias spikes indicating process issues
+    - Volume anomalies that may explain accuracy problems
+    
+    Parameters
+    ----------
+    group_by : hierarchy columns to group by (SALES_DATE is always added),
+               e.g. ["Forecast Level"], ["Franchise"], ["Product Line"]
+    metric : 'accuracy' | 'bias' | 'volume' — which metric to analyze
+    lag : 'L2' | 'L1' | 'L0' | 'Fcst' — forecast lag (for accuracy/bias)
+    window : time window for analysis (default: last_12_months)
+    filters : optional {col: value} filters to scope the analysis
+    threshold_std : number of standard deviations for anomaly detection (default: 2.0)
+                    Lower = more sensitive, Higher = only major anomalies
+    
+    Returns
+    -------
+    Table with one row per (group, month) including:
+      - metric value (accuracy/bias/volume)
+      - rolling_mean, rolling_std (3-month window)
+      - lower_bound, upper_bound (anomaly thresholds)
+      - is_anomaly (boolean)
+      - anomaly_direction ('high' | 'low' | None)
+    
+    Usage pattern
+    -------------
+    1. Call with group_by=["Forecast Level"] to find anomalous regions
+    2. Filter to anomalous region, call with group_by=["Franchise"]
+    3. Continue drilling down to root cause level
+    4. Use findings to add drill-down slides via drill_down_slide()
+    """
+    ds = _get_ds()
+    from metrics import detect_anomalies_in_trend as _detect
+    
+    result = _detect(
+        df_raw=ds.df,
+        group_by_cols=group_by,
+        metric=metric,
+        lag=lag,
+        window=window,
+        filters=filters,
+        threshold_std=threshold_std,
+    )
+    return _df_to_dict(result)
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# TOOL 13 — add_slide
 # ════════════════════════════════════════════════════════════════════════════
 
 @mcp.tool()

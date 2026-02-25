@@ -196,6 +196,12 @@ def generate_standard_report(
         logger.warning(f"yoy failed: {e}")
         briefing["yoy"] = []
 
+    try:
+        briefing["evolution"] = _evolution(df_base, window)
+    except Exception as e:
+        logger.warning(f"evolution failed: {e}")
+        briefing["evolution"] = {"volume": [], "accuracy": []}
+
     return briefing
 
 
@@ -344,23 +350,37 @@ def _trend(df_base: pl.DataFrame) -> dict:
 def _yoy(df_base: pl.DataFrame) -> list[dict]:
     """
     Year-over-year actual volume: last 3 available years, compact.
+    Current year includes actuals (completed months) + forecast (remaining months).
+    Returns detailed data for table including volume and growth percentages.
     """
     from data import FCST_DF_VOL, FCST_STAT_VOL
+    from datetime import date
 
     if df_base.is_empty():
         return []
 
+    # Determine current year for labeling
+    today = date.today()
+    current_year = today.year
+    
     df_y = df_base.with_columns(pl.col("SALES_DATE").dt.year().alias("Year"))
     agg = df_y.group_by("Year").agg([
         pl.col(ACT_VOL).sum().alias("act_vol"),
         pl.col(FCST_DF_VOL).sum().alias("df_vol"),
+        pl.col(FCST_STAT_VOL).sum().alias("stat_vol"),
     ]).sort("Year")
 
     rows = agg.tail(3).iter_rows(named=True)
     result = []
     prev_act = None
     for row in rows:
-        entry = {"year": row["Year"], "act_vol": _safe(row["act_vol"])}
+        entry = {
+            "year": row["Year"],
+            "is_current": row["Year"] == current_year,
+            "act_vol": _safe(row["act_vol"]),
+            "df_vol": _safe(row["df_vol"]),
+            "stat_vol": _safe(row["stat_vol"]),
+        }
         if prev_act and prev_act != 0:
             entry["yoy_pct"] = _safe((row["act_vol"] - prev_act) / prev_act)
         else:
@@ -368,6 +388,47 @@ def _yoy(df_base: pl.DataFrame) -> list[dict]:
         prev_act = row["act_vol"]
         result.append(entry)
     return result
+
+
+def _evolution(df_base: pl.DataFrame, window: str) -> dict:
+    """
+    Forecast evolution across lags (L2 → L1 → L0 → Fcst) vs Actuals.
+    Returns both volume evolution and accuracy evolution.
+    """
+    from data import ALL_LAGS
+    from metrics import compute_forecast_evolution, compute_forecast_evolution_accuracy
+    
+    if df_base.is_empty():
+        return {"volume": [], "accuracy": []}
+    
+    # Volume evolution
+    vol_evo = compute_forecast_evolution(df_raw=df_base, filters=None, window=window)
+    volume_data = []
+    if not vol_evo.is_empty():
+        for row in vol_evo.sort("SALES_DATE").iter_rows(named=True):
+            volume_data.append({
+                "month": str(row["SALES_DATE"])[:7],
+                "actual": _safe(row["Sum Act Vol"]),
+                "l2_df": _safe(row.get("L2 DF Sum Fcst")),
+                "l1_df": _safe(row.get("L1 DF Sum Fcst")),
+                "l0_df": _safe(row.get("L0 DF Sum Fcst")),
+                "fcst_df": _safe(row.get("Fcst DF Sum Fcst")),
+            })
+    
+    # Accuracy evolution
+    acc_evo = compute_forecast_evolution_accuracy(df_raw=df_base, filters=None, window=window)
+    accuracy_data = []
+    if not acc_evo.is_empty():
+        for row in acc_evo.sort("SALES_DATE").iter_rows(named=True):
+            accuracy_data.append({
+                "month": str(row["SALES_DATE"])[:7],
+                "actual_vol": _safe(row["Sum Act Vol"]),
+                "l2_df_acc": _safe(row.get("L2 DF Acc")),
+                "l1_df_acc": _safe(row.get("L1 DF Acc")),
+                "l0_df_acc": _safe(row.get("L0 DF Acc")),
+            })
+    
+    return {"volume": volume_data, "accuracy": accuracy_data}
 
 
 # ── drill_down_slide computation ─────────────────────────────────────────────
@@ -826,79 +887,97 @@ def build_standard_slides(briefing: dict, builder: Any) -> None:
             ),
         ))
 
-    # ── Slide 7: Bias by Forecast Level ──────────────────────────────────────
-    if fl_rows:
-        fl_labels = [r["Forecast Level"] for r in fl_rows]
-        bias_vals = [round(r["bias_pct"] * 100, 1) if r["bias_pct"] is not None else None for r in fl_rows]
+    # ── Slide 7: Forecast Evolution - Volume ─────────────────────────────────
+    evolution = briefing.get("evolution", {})
+    vol_data = evolution.get("volume", [])
+    if len(vol_data) >= 3:
+        months = [d["month"] for d in vol_data[-6:]]  # Last 6 months
         builder.add_slide(Slide(
-            slide_id="bias_summary",
+            slide_id="forecast_evolution_volume",
             layout="chart",
-            title="DF Bias by Forecast Level (L2)",
+            title="Forecast Evolution - Volume Across Lags",
+            subtitle="How forecast volume changed from L2 to Final forecast",
             chart=ChartSpec(
-                chart_type="bar",
-                title="DF Bias % by Forecast Level  (+ve = under-fcst, -ve = over-fcst)",
-                x_data=fl_labels,
-                y_data=bias_vals,
-                x_label="Forecast Level",
-                y_label="Bias %",
-                show_legend=False,
-                height=340,
+                chart_type="line",
+                title="Volume Evolution: L2 → L1 → L0 → Final vs Actual",
+                x_data=months,
+                y_data={
+                    "Actual": [d["actual"] for d in vol_data[-6:]],
+                    "L2 Forecast": [d["l2_df"] for d in vol_data[-6:]],
+                    "L1 Forecast": [d["l1_df"] for d in vol_data[-6:]],
+                    "L0 Forecast": [d["l0_df"] for d in vol_data[-6:]],
+                    "Final Fcst": [d["fcst_df"] for d in vol_data[-6:]],
+                },
+                x_label="Month",
+                y_label="Volume (Units)",
+                show_legend=True,
+                height=380,
             ),
         ))
 
-    # ── Slide 8: FVA by Forecast Level ───────────────────────────────────────
-    if fl_rows:
-        fl_labels = [r["Forecast Level"] for r in fl_rows]
-        fva_vals = [round(r["fva"] * 100, 1) if r["fva"] is not None else None for r in fl_rows]
-        headers = ["Forecast Level", "DF Acc %", "Stat Acc %", "FVA %"]
-        table_rows = [
-            [
-                r["Forecast Level"],
-                f"{r['df_acc']*100:.1f}%" if r["df_acc"] is not None else "N/A",
-                f"{r['stat_acc']*100:.1f}%" if r["stat_acc"] is not None else "N/A",
-                f"{r['fva']*100:.1f}%" if r["fva"] is not None else "N/A",
-            ]
-            for r in fl_rows
-        ]
+    # ── Slide 8: Forecast Evolution - Accuracy ───────────────────────────────
+    acc_data = evolution.get("accuracy", [])
+    if len(acc_data) >= 3:
+        months = [d["month"] for d in acc_data[-6:]]
         builder.add_slide(Slide(
-            slide_id="fva_summary",
-            layout="chart_table",
-            title="Forecast Value Add (FVA) by Forecast Level",
+            slide_id="forecast_evolution_accuracy",
+            layout="chart",
+            title="Forecast Evolution - Accuracy Development",
+            subtitle="How accuracy improved as we got closer to the period",
             chart=ChartSpec(
-                chart_type="bar",
-                title="FVA % by Forecast Level  (+ve = DF beats Stat)",
-                x_data=fl_labels,
-                y_data=fva_vals,
-                x_label="Forecast Level",
-                y_label="FVA % pts",
-                show_legend=False,
-                height=280,
-            ),
-            table=TableSpec(
-                headers=headers,
-                rows=table_rows,
-                highlight_col=3,
-                highlight_thresholds=(-5, 5),
+                chart_type="line",
+                title="Accuracy Evolution: L2 → L1 → L0 (Last 6 Months)",
+                x_data=months,
+                y_data={
+                    "L2 Accuracy": [d["l2_df_acc"] * 100 if d["l2_df_acc"] else None for d in acc_data[-6:]],
+                    "L1 Accuracy": [d["l1_df_acc"] * 100 if d["l1_df_acc"] else None for d in acc_data[-6:]],
+                    "L0 Accuracy": [d["l0_df_acc"] * 100 if d["l0_df_acc"] else None for d in acc_data[-6:]],
+                },
+                x_label="Month",
+                y_label="Accuracy %",
+                show_legend=True,
+                height=380,
             ),
         ))
 
     # ── Slide 9: YoY Volume Growth ────────────────────────────────────────────
     yoy_rows = briefing.get("yoy", [])
     if len(yoy_rows) >= 2:
-        years = [str(r["year"]) for r in yoy_rows]
+        years = [str(r["year"]) + (" (E)" if r.get("is_current") else "") for r in yoy_rows]
         vols = [r["act_vol"] for r in yoy_rows]
+        
+        # Build detailed table with volumes and growth rates
+        table_headers = ["Year", "Actual Volume", "DF Forecast", "Stat Forecast", "YoY Growth %"]
+        table_rows = []
+        for r in yoy_rows:
+            year_label = str(r["year"]) + (" (E)" if r.get("is_current") else "")
+            yoy_pct_str = f"{r['yoy_pct']*100:+.1f}%" if r.get("yoy_pct") is not None else "N/A"
+            table_rows.append([
+                year_label,
+                f"{r['act_vol']:,.0f}" if r["act_vol"] else "N/A",
+                f"{r['df_vol']:,.0f}" if r.get("df_vol") else "N/A",
+                f"{r['stat_vol']:,.0f}" if r.get("stat_vol") else "N/A",
+                yoy_pct_str,
+            ])
+        
         builder.add_slide(Slide(
             slide_id="yoy_growth",
-            layout="chart",
-            title="Year-over-Year Actual Volume",
+            layout="chart_table",
+            title="Year-over-Year Volume Growth",
             chart=ChartSpec(
                 chart_type="bar",
-                title="Annual Actual Volume",
+                title="Annual Actual Volume (Current year includes forecast for remaining months)",
                 x_data=years,
                 y_data=vols,
                 x_label="Year",
                 y_label="Units",
                 show_legend=False,
-                height=340,
+                height=280,
+            ),
+            table=TableSpec(
+                headers=table_headers,
+                rows=table_rows,
+                highlight_col=4,  # Highlight YoY Growth % column
+                highlight_thresholds=(-5, 5),  # Red if < -5%, Green if > +5%
             ),
         ))
