@@ -20,16 +20,20 @@ Tools exposed:
         9.  get_forecast_evolution
         10. get_top_offenders
 
-    Presentation (standard workflow):
-        11. initialize_presentation
-        12. add_slide
-        13. finalize_presentation
+    Presentation (new / edit session):
+        11. initialize_presentation   — start a blank new presentation
+        12. add_slide                  — append a slide to the current session
+        13. finalize_presentation      — write HTML + sidecar .state.json
 
-    Efficient report generation (NEW):
+    Efficient report generation:
         14. generate_standard_report  — pre-compute all standard slides in one call
         15. add_commentary            — LLM writes text to a named slide
         16. get_presentation_status   — list slide IDs + commentary state (resume support)
         17. drill_down_slide          — append one drill-down slide at any hierarchy level
+
+    Editing existing presentations:
+        18. list_presentations        — list saved HTML files; flags which are editable
+        19. load_presentation         — reload a saved presentation for editing
 """
 
 from __future__ import annotations
@@ -1077,6 +1081,154 @@ def drill_down_slide(
         "parent_col": hierarchy_col,
         "parent_value": hierarchy_value,
         "briefing_summary": result["rows"],
+    }
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# TOOL 18 — list_presentations
+# ════════════════════════════════════════════════════════════════════════════
+
+@mcp.tool()
+def list_presentations() -> dict:
+    """
+    List all saved presentation HTML files in the output directory.
+
+    Use this to discover which presentations exist and which ones can
+    be loaded for editing.
+
+    Returns
+    -------
+    {
+        "output_dir": str,
+        "presentations": [
+            {
+                "filename"  : str,   # e.g. "demand_review_20260225_1200.html"
+                "path"      : str,   # full absolute path
+                "has_state" : bool,  # True → editable via load_presentation()
+                "size_kb"   : float,
+                "modified"  : str,   # ISO datetime
+            },
+            ...
+        ]
+    }
+    """
+    from datetime import datetime as _dt
+
+    state = _get_state()
+    output_dir = Path(state.config.get("output_dir", "output"))
+
+    if not output_dir.exists():
+        return {"output_dir": str(output_dir), "presentations": []}
+
+    entries = []
+    for html_path in sorted(output_dir.glob("*.html"), key=lambda p: p.stat().st_mtime, reverse=True):
+        state_path = html_path.with_suffix(html_path.suffix + ".state.json")
+        stat = html_path.stat()
+        entries.append({
+            "filename" : html_path.name,
+            "path"     : str(html_path.resolve()),
+            "has_state": state_path.exists(),
+            "size_kb"  : round(stat.st_size / 1024, 1),
+            "modified" : _dt.fromtimestamp(stat.st_mtime).isoformat(timespec="seconds"),
+        })
+
+    return {
+        "output_dir"   : str(output_dir.resolve()),
+        "presentations": entries,
+    }
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# TOOL 19 — load_presentation
+# ════════════════════════════════════════════════════════════════════════════
+
+@mcp.tool()
+def load_presentation(filename: str) -> dict:
+    """
+    Load an existing presentation for editing.
+
+    Reads the sidecar .state.json that was written by finalize_presentation()
+    and restores the full in-memory session (all slides with their original
+    slide_ids). After calling this tool you can:
+      • add_commentary(slide_id, ...)   — update/add commentary to any slide
+      • add_slide(...)                  — append new slides
+      • drill_down_slide(...)           — append drill-down slides
+      • get_presentation_status()       — see the full slide list
+      • finalize_presentation(filename) — overwrite the original file
+
+    Parameters
+    ----------
+    filename : HTML filename to load (just the name, e.g. "demand_review_20260225.html").
+               Must exist in the configured output directory and have a matching
+               .state.json sidecar file created by finalize_presentation().
+
+    Returns
+    -------
+    On success:
+        {
+            "status"        : "loaded",
+            "filename"      : str,
+            "title"         : str,
+            "subtitle"      : str,
+            "slide_count"   : int,
+            "slides"        : [...],  # same format as get_presentation_status()
+            "commentary_complete": bool,
+        }
+    On error:
+        {"error": str, "available": [list of editable filenames]}
+    """
+    from presentation import PresentationBuilder
+
+    state = _get_state()
+    output_dir = Path(state.config.get("output_dir", "output"))
+
+    html_path  = output_dir / filename
+    state_path = html_path.with_suffix(html_path.suffix + ".state.json")
+
+    # Build list of editable files for helpful error messages.
+    def _editable():
+        if not output_dir.exists():
+            return []
+        return [
+            p.name for p in sorted(output_dir.glob("*.html"), key=lambda x: x.stat().st_mtime, reverse=True)
+            if p.with_suffix(p.suffix + ".state.json").exists()
+        ]
+
+    if not html_path.exists():
+        return {
+            "error"    : f"File not found: {html_path}",
+            "available": _editable(),
+        }
+
+    if not state_path.exists():
+        return {
+            "error": (
+                f"No editable state found for '{filename}'. "
+                "Only presentations created by this server (finalize_presentation) "
+                "can be reloaded. The sidecar file would be: "
+                f"{state_path.name}"
+            ),
+            "available": _editable(),
+        }
+
+    try:
+        state.presentation = PresentationBuilder.from_state_file(
+            state_path=state_path,
+            brand=state.brand,
+            output_dir=output_dir,
+        )
+    except Exception as exc:
+        return {"error": f"Failed to load state: {exc}"}
+
+    slides = state.presentation.status()
+    return {
+        "status"             : "loaded",
+        "filename"           : filename,
+        "title"              : state.presentation.title,
+        "subtitle"           : state.presentation.subtitle,
+        "slide_count"        : len(slides),
+        "slides"             : slides,
+        "commentary_complete": all(s["has_commentary"] for s in slides) if slides else False,
     }
 
 

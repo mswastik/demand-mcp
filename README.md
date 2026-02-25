@@ -1,9 +1,10 @@
 # Demand Planning MCP Server
 
-An MCP server exposing 13 tools for automated demand planning analysis.
+An MCP server exposing **19 tools** for automated demand planning analysis.
 The LLM orchestrates these tools to navigate product/location hierarchies,
 compute accuracy/bias/FVA metrics, identify root causes, and produce
-a self-contained Reveal.js HTML presentation.
+a self-contained Reveal.js HTML presentation — and to load and edit
+an existing presentation without rebuilding it from scratch.
 
 ---
 
@@ -11,7 +12,7 @@ a self-contained Reveal.js HTML presentation.
 
 ```
 demand_mcp/
-├── server.py          # FastMCP server entry point — 13 tools
+├── server.py          # FastMCP server entry point — 19 tools
 ├── data.py            # Data loading, PackContent normalization, filters
 ├── metrics.py         # Accuracy, bias, FVA, YoY, evolution computations
 ├── presentation.py    # Reveal.js + Plotly HTML builder
@@ -99,32 +100,46 @@ response = client.chat("Generate a demand planning review for last month.")
 
 ---
 
-## The 13 Tools
+## The 19 Tools
 
 ### Data Exploration
-| Tool | Purpose |
-|------|---------|
-| `get_data_info` | Row count, date range, hierarchy unique counts |
-| `get_hierarchy_members` | List values at any hierarchy level (with optional filters) |
-| `get_date_range` | Available months (with optional filters) |
+| # | Tool | Purpose |
+|---|------|---------|
+| 1 | `get_data_info` | Row count, date range, hierarchy unique counts |
+| 2 | `get_hierarchy_members` | List values at any hierarchy level (with optional filters) |
+| 3 | `get_date_range` | Available months (with optional filters) |
 
 ### Metrics
-| Tool | Purpose |
-|------|---------|
-| `compute_accuracy_summary` | Accuracy (all 4 lags) grouped by any hierarchy combo |
-| `compute_bias_summary` | Bias % and units (all 4 lags) |
-| `compute_fva_summary` | FVA = DF Accuracy − Stat Accuracy |
-| `get_accuracy_trend` | Monthly accuracy trend for a given lag |
-| `get_yoy_growth` | Year-over-year volume growth vs DF and Stat forecasts |
-| `get_forecast_evolution` | L2 → L1 → L0 → Fcst vs Actuals by month |
-| `get_top_offenders` | Rank hierarchy members by any metric (for drill-down) |
+| # | Tool | Purpose |
+|---|------|---------|
+| 4 | `compute_accuracy_summary` | Accuracy (all 4 lags) grouped by any hierarchy combo |
+| 5 | `compute_bias_summary` | Bias % and units (all 4 lags) |
+| 6 | `compute_fva_summary` | FVA = DF Accuracy − Stat Accuracy |
+| 7 | `get_accuracy_trend` | Monthly accuracy trend for a given lag |
+| 8 | `get_yoy_growth` | Year-over-year volume growth vs DF and Stat forecasts |
+| 9 | `get_forecast_evolution` | L2 → L1 → L0 → Fcst vs Actuals by month |
+| 10 | `get_top_offenders` | Rank hierarchy members by any metric (for drill-down) |
 
-### Presentation
-| Tool | Purpose |
-|------|---------|
-| `initialize_presentation` | Start a new HTML presentation |
-| `add_slide` | Add a slide (title/metrics/chart/table/chart_table/two_col/commentary) |
-| `finalize_presentation` | Write the HTML file, returns output path |
+### Presentation (build new)
+| # | Tool | Purpose |
+|---|------|---------|
+| 11 | `initialize_presentation` | Start a new blank HTML presentation session |
+| 12 | `add_slide` | Append a slide (title/metrics/chart/table/chart_table/two_col/commentary) |
+| 13 | `finalize_presentation` | Write HTML + sidecar `.state.json`; returns output path |
+
+### Efficient Report Generation
+| # | Tool | Purpose |
+|---|------|---------|
+| 14 | `generate_standard_report` | Pre-compute all 9 standard slides + return briefing JSON in one call |
+| 15 | `add_commentary` | Write narrative text to a named slide (by `slide_id`) |
+| 16 | `get_presentation_status` | List all slides, IDs, and commentary state — use to resume after reset |
+| 17 | `drill_down_slide` | Append a focused drill-down slide at the next hierarchy level |
+
+### Editing Existing Presentations
+| # | Tool | Purpose |
+|---|------|---------|
+| 18 | `list_presentations` | List saved HTML files in the output dir; flags which are editable |
+| 19 | `load_presentation` | Reload a saved presentation into memory for editing |
 
 ---
 
@@ -177,3 +192,19 @@ Generated presentations are saved to the `output_dir` specified in `config.yaml`
 Open the `.html` file in any browser — no server needed, all dependencies are CDN-linked.
 
 Use arrow keys or click to navigate slides. Speaker notes can be toggled with `S`.
+
+### Sidecar state file
+
+`finalize_presentation()` writes two files every time:
+
+```
+output/
+  demand_review_20260225_1200.html           ← the browser presentation
+  demand_review_20260225_1200.html.state.json ← structured slide data (editable)
+```
+
+The `.state.json` stores every slide's layout, chart data, table data, commentary,
+and `slide_id`. `load_presentation(filename)` reads this file to restore the full
+editing session — all subsequent tools (`add_slide`, `add_commentary`,
+`drill_down_slide`, `finalize_presentation`) then work exactly as if the session
+had never ended.

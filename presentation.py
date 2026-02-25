@@ -2,11 +2,23 @@
 presentation.py — Reveal.js HTML presentation builder.
 
 Manages a presentation session in memory. The LLM calls:
-  1. initialize_presentation(title, subtitle)
-  2. add_slide(...) one or more times
-  3. finalize_presentation() → writes HTML file and returns path
+
+  New presentation:
+    1. initialize_presentation(title, subtitle)
+    2. add_slide(...) one or more times
+    3. finalize_presentation() → writes HTML file + sidecar .state.json
+
+  Edit existing presentation:
+    1. load_presentation(filename) → restores session from .state.json
+    2. add_slide / add_commentary / drill_down_slide as needed
+    3. finalize_presentation(filename=...) → overwrites original file
 
 Charts are rendered as Plotly JSON embedded inline (no server needed).
+
+State persistence:
+  finalize() writes <filename>.state.json alongside the HTML. This JSON
+  stores every slide's structured data so the session can be fully
+  restored via PresentationBuilder.from_state_file().
 """
 
 from __future__ import annotations
@@ -112,7 +124,130 @@ class PresentationBuilder:
         out_path = self.output_dir / filename
         html = self._render_html()
         out_path.write_text(html, encoding="utf-8")
+
+        # Write sidecar state file so the session can be reloaded for editing.
+        state_path = out_path.with_suffix(out_path.suffix + ".state.json")
+        state = {
+            "title": self.title,
+            "subtitle": self.subtitle,
+            "created_at": self.created_at.isoformat(),
+            "html_filename": filename,
+            "slides": [self._slide_to_dict(s) for s in self.slides],
+        }
+        state_path.write_text(json.dumps(state, indent=2), encoding="utf-8")
+
         return out_path
+
+    @classmethod
+    def from_state_file(
+        cls,
+        state_path: str | Path,
+        brand: dict,
+        output_dir: str | Path,
+    ) -> "PresentationBuilder":
+        """Restore a PresentationBuilder from a sidecar .state.json file.
+
+        All slides (with their original slide_ids) are reconstructed so
+        the caller can immediately call add_slide / add_commentary /
+        finalize as if the session had never ended.
+        """
+        state_path = Path(state_path)
+        raw = json.loads(state_path.read_text(encoding="utf-8"))
+
+        builder = cls(brand=brand, output_dir=output_dir)
+        builder.title = raw.get("title", "Demand Planning Review")
+        builder.subtitle = raw.get("subtitle", "")
+        try:
+            builder.created_at = datetime.fromisoformat(raw["created_at"])
+        except Exception:
+            pass  # keep default
+
+        for sd in raw.get("slides", []):
+            builder.slides.append(cls._slide_from_dict(sd))
+
+        return builder
+
+    # ── State serialisation helpers ──────────────────────────────────────────
+
+    @staticmethod
+    def _slide_to_dict(s: "Slide") -> dict:
+        """Convert a Slide to a plain JSON-serialisable dict."""
+        def _chart(c: Optional["ChartSpec"]) -> dict | None:
+            if c is None:
+                return None
+            return {
+                "chart_type": c.chart_type,
+                "title": c.title,
+                "x_data": c.x_data,
+                "y_data": c.y_data,
+                "x_label": c.x_label,
+                "y_label": c.y_label,
+                "colors": c.colors,
+                "show_legend": c.show_legend,
+                "height": c.height,
+            }
+
+        def _table(t: Optional["TableSpec"]) -> dict | None:
+            if t is None:
+                return None
+            return {
+                "headers": t.headers,
+                "rows": t.rows,
+                "highlight_col": t.highlight_col,
+                "highlight_thresholds": list(t.highlight_thresholds) if t.highlight_thresholds else None,
+            }
+
+        return {
+            "slide_id": s.slide_id,
+            "layout": s.layout,
+            "title": s.title,
+            "subtitle": s.subtitle,
+            "commentary": s.commentary,
+            "chart": _chart(s.chart),
+            "chart2": _chart(s.chart2),
+            "table": _table(s.table),
+        }
+
+    @staticmethod
+    def _slide_from_dict(d: dict) -> "Slide":
+        """Reconstruct a Slide from its serialised dict."""
+        def _chart(c: dict | None) -> Optional["ChartSpec"]:
+            if not c:
+                return None
+            return ChartSpec(
+                chart_type=c["chart_type"],
+                title=c["title"],
+                x_data=c["x_data"],
+                y_data=c["y_data"],
+                x_label=c.get("x_label", ""),
+                y_label=c.get("y_label", ""),
+                colors=c.get("colors"),
+                show_legend=c.get("show_legend", True),
+                height=c.get("height", 380),
+            )
+
+        def _table(t: dict | None) -> Optional["TableSpec"]:
+            if not t:
+                return None
+            ht = t.get("highlight_thresholds")
+            return TableSpec(
+                headers=t["headers"],
+                rows=t["rows"],
+                highlight_col=t.get("highlight_col"),
+                highlight_thresholds=tuple(ht) if ht else None,
+            )
+
+        slide = Slide(
+            layout=d["layout"],
+            title=d["title"],
+            subtitle=d.get("subtitle", ""),
+            commentary=d.get("commentary", ""),
+            chart=_chart(d.get("chart")),
+            chart2=_chart(d.get("chart2")),
+            table=_table(d.get("table")),
+            slide_id=d["slide_id"],  # preserve original IDs
+        )
+        return slide
 
     # ── HTML rendering ──────────────────────────────────────────────────────
 
@@ -175,12 +310,10 @@ class PresentationBuilder:
 
     /* Section header bar */
     .slide-header {{
-      background: var(--secondary);
-      color: white;
       margin: -0.5rem -1.5rem 1rem -1.5rem;
       padding: 0.5rem 1.5rem;
       font-family: var(--font-heading);
-      font-size: 1.6rem;
+      font-size: 2.2rem;
       font-weight: 600;
       display: flex; align-items: center; gap: 0.75rem;
     }}
@@ -409,7 +542,7 @@ class PresentationBuilder:
         return f"""<div class="slide-header">
   <div class="accent-bar"></div>
   {title}
-  <img style="margin-left:auto;" src="{self.brand.get('logo_path', '')}" alt="Logo">
+  <img style="margin-left:auto;" src="{self.brand.get('logo_path', '')}" alt="Logo" width="11%" height="11%">
 </div>"""
 
     def _footer(self) -> str:

@@ -2,7 +2,7 @@
 # Edit these values before starting the server.
 
 # Path to the parquet data file
-parquet_path: "C:\\Users\\smishra14\\OneDrive - Stryker\\data\\APAC-Stat2.parquet"
+parquet_path: "C:\\Users\\smishra14\\OneDrive - Stryker\\data\\APAC-Stat.parquet"
 
 # Directory where HTML presentation output will be written
 output_dir: "output"
