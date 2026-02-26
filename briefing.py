@@ -353,7 +353,7 @@ def _yoy(df_base: pl.DataFrame) -> list[dict]:
     Current year includes actuals (completed months) + forecast (remaining months).
     Returns detailed data for table including volume and growth percentages.
     """
-    from data import FCST_DF_VOL, FCST_STAT_VOL
+    from data import FCST_DF_VOL, FCST_STAT_VOL, ACT_VOL
     from datetime import date
 
     if df_base.is_empty():
@@ -362,15 +362,72 @@ def _yoy(df_base: pl.DataFrame) -> list[dict]:
     # Determine current year for labeling
     today = date.today()
     current_year = today.year
-    
-    df_y = df_base.with_columns(pl.col("SALES_DATE").dt.year().alias("Year"))
-    agg = df_y.group_by("Year").agg([
-        pl.col(ACT_VOL).sum().alias("act_vol"),
-        pl.col(FCST_DF_VOL).sum().alias("df_vol"),
-        pl.col(FCST_STAT_VOL).sum().alias("stat_vol"),
-    ]).sort("Year")
+    last_completed_month = today.month - 1 if today.month > 1 else 12
 
-    rows = agg.tail(3).iter_rows(named=True)
+    # Add year and month columns
+    df_y = df_base.with_columns([
+        pl.col("SALES_DATE").dt.year().alias("Year"),
+        pl.col("SALES_DATE").dt.month().alias("Month"),
+    ])
+    
+    # Split current year and historical years
+    df_current = df_y.filter(pl.col("Year") == current_year)
+    df_historical = df_y.filter(pl.col("Year") < current_year)
+    
+    # For current year: actuals for completed months + forecast for remaining
+    df_current_actuals = df_current.filter(pl.col("Month") <= last_completed_month)
+    df_current_forecast = df_current.filter(pl.col("Month") > last_completed_month)
+    
+    # Aggregate historical years
+    if not df_historical.is_empty():
+        historical_agg = df_historical.group_by("Year").agg([
+            pl.col(ACT_VOL).sum().alias("act_vol"),
+            pl.col(FCST_DF_VOL).sum().alias("df_vol"),
+            pl.col(FCST_STAT_VOL).sum().alias("stat_vol"),
+        ])
+    else:
+        historical_agg = None
+    
+    # Aggregate current year actuals
+    if not df_current_actuals.is_empty():
+        current_actuals_agg = df_current_actuals.group_by("Year").agg([
+            pl.col(ACT_VOL).sum().alias("act_vol"),
+            pl.col(FCST_DF_VOL).sum().alias("df_vol"),
+            pl.col(FCST_STAT_VOL).sum().alias("stat_vol"),
+        ])
+    else:
+        current_actuals_agg = None
+    
+    # Add forecast for remaining months to current year
+    if not df_current_forecast.is_empty() and current_actuals_agg is not None:
+        forecast_remaining = df_current_forecast.group_by("Year").agg([
+            pl.col(FCST_DF_VOL).sum().alias("df_fcst_rem"),
+            pl.col(FCST_STAT_VOL).sum().alias("stat_fcst_rem"),
+        ])
+        current_agg = current_actuals_agg.join(forecast_remaining, on="Year", how="left").with_columns([
+            (pl.col("act_vol") + pl.col("df_fcst_rem")).alias("act_vol"),
+            (pl.col("df_vol") + pl.col("df_fcst_rem")).alias("df_vol"),
+            (pl.col("stat_vol") + pl.col("stat_fcst_rem")).alias("stat_vol"),
+        ])
+    elif current_actuals_agg is not None:
+        current_agg = current_actuals_agg
+    else:
+        current_agg = None
+    
+    # Combine historical and current
+    if historical_agg is not None and current_agg is not None:
+        combined = pl.concat([historical_agg, current_agg])
+    elif current_agg is not None:
+        combined = current_agg
+    elif historical_agg is not None:
+        combined = historical_agg
+    else:
+        return []
+    
+    # Sort and compute YoY
+    combined = combined.sort("Year")
+    rows = combined.tail(3).iter_rows(named=True)
+    
     result = []
     prev_act = None
     for row in rows:
@@ -704,16 +761,17 @@ def build_standard_slides(briefing: dict, builder: Any) -> None:
 
     filters = briefing.get("filters_applied", {})
     window = briefing.get("window", "")
-    scope = ", ".join(f"{k}: {v}" for k, v in filters.items()) if filters else "All"
+    scope = ", ".join(v for k, v in filters.items()) if filters else "All"
     dr = briefing.get("date_range", {})
-    period_label = f"{dr.get('min','')} to {dr.get('max','')} | Window: {window} | Scope: {scope}"
+    period_label = f"""<div style="padding-top:60px; padding-bottom:160px; font-family:Arial Black;>{scope}</div>
+                        <div style="font-size: 0.75rem; color: var(--text-muted); margin-top:auto;">{dr.get('min','')} to {dr.get('max','')} | Window: {window}</div>"""
 
     # ── Slide 1: Cover ────────────────────────────────────────────────────────
     builder.add_slide(Slide(
         slide_id="cover",
         layout="title",
         title=builder.title,
-        subtitle=period_label,
+        commentary=period_label,
     ))
 
     # ── Slide 2: KPI Summary ─────────────────────────────────────────────────
@@ -738,7 +796,6 @@ def build_standard_slides(briefing: dict, builder: Any) -> None:
             if total_vol else None
         )
 
-        import json
         cards = [
             {
                 "label": "DF Accuracy (L2)",
@@ -768,8 +825,8 @@ def build_standard_slides(briefing: dict, builder: Any) -> None:
         builder.add_slide(Slide(
             slide_id="kpi_summary",
             layout="metrics",
-            title="Forecast Performance Summary",
-            commentary=json.dumps(cards),
+            title="Executive Performance Summary",
+            cards=cards,  # Store cards separately so commentary can be added later
         ))
 
     # ── Slide 3: Accuracy Trend ───────────────────────────────────────────────
@@ -777,24 +834,35 @@ def build_standard_slides(briefing: dict, builder: Any) -> None:
     if trend.get("months"):
         df_acc_pct = [round(v * 100, 1) if v is not None else None for v in trend["df_acc"]]
         stat_acc_pct = [round(v * 100, 1) if v is not None else None for v in trend["stat_acc"]]
+        
+        # Add target line at 70% for all months
+        target_line = [70.0] * len(trend["months"])
+        
         builder.add_slide(Slide(
             slide_id="accuracy_trend",
             layout="chart",
             title="12-Month L2 Accuracy Trend",
+            subtitle="Track accuracy performance against 70% target",
             chart=ChartSpec(
                 chart_type="line",
-                title="DF vs Stat Accuracy (L2) — Monthly",
+                title="DF vs Stat Accuracy (L2) — Monthly Performance vs Target",
                 x_data=trend["months"],
-                y_data={"DF Accuracy %": df_acc_pct, "Stat Accuracy %": stat_acc_pct},
+                y_data={
+                    "DF Accuracy %": df_acc_pct,
+                    "Stat Accuracy %": stat_acc_pct,
+                    "Target (70%)": target_line,
+                },
                 x_label="Month",
-                y_label="Accuracy %",
+                y_label="Accuracy % (Target: 70%)",
+                #colors=["#1f77b4", "#ff7f0e", "#2ca02c"],  # Blue, Orange, Green
                 show_legend=True,
-                height=340,
+                height=380,
             ),
         ))
 
-    # ── Slide 4: Forecast Level Summary table ────────────────────────────────
+    # ── Slide 4: Forecast Level Performance (Combined View) ──────────────────
     if fl_rows:
+        # Build comprehensive table with all metrics
         headers = ["Forecast Level", "DF Acc %", "Stat Acc %", "FVA %", "Bias %", "Act Vol"]
         table_rows = [
             [
@@ -807,23 +875,38 @@ def build_standard_slides(briefing: dict, builder: Any) -> None:
             ]
             for r in fl_rows
         ]
-        # Also build a bar chart of DF accuracy by Forecast Level
+        
+        # Build charts for two-col layout
         fl_labels = [r["Forecast Level"] for r in fl_rows]
         fl_df_acc = [round(r["df_acc"] * 100, 1) if r["df_acc"] is not None else None for r in fl_rows]
         fl_stat_acc = [round(r["stat_acc"] * 100, 1) if r["stat_acc"] is not None else None for r in fl_rows]
+        fl_bias = [round(r["bias_pct"] * 100, 1) if r["bias_pct"] is not None else None for r in fl_rows]
+        fl_fva = [round(r["fva"] * 100, 1) if r["fva"] is not None else None for r in fl_rows]
+        
         builder.add_slide(Slide(
             slide_id="by_forecast_level",
-            layout="chart_table",
-            title="Accuracy by Forecast Level",
+            layout="two_col_chart_table",
+            title="Forecast Level Performance - Multi-Metric View",
+            subtitle="Left: Accuracy comparison | Right: Bias & FVA",
             chart=ChartSpec(
                 chart_type="grouped_bar",
-                title="DF vs Stat Accuracy % by Forecast Level",
+                title="DF vs Stat Accuracy % by Region",
                 x_data=fl_labels,
-                y_data={"DF": fl_df_acc, "Stat": fl_stat_acc},
+                y_data={"DF Accuracy %": fl_df_acc, "Stat Accuracy %": fl_stat_acc},
                 x_label="Forecast Level",
                 y_label="Accuracy %",
                 show_legend=True,
-                height=280,
+                height=240,
+            ),
+            chart2=ChartSpec(
+                chart_type="grouped_bar",
+                title="Bias % and FVA % by Region",
+                x_data=fl_labels,
+                y_data={"Bias %": fl_bias, "FVA %": fl_fva},
+                x_label="Forecast Level",
+                y_label="Percentage",
+                show_legend=True,
+                height=240,
             ),
             table=TableSpec(
                 headers=headers,
@@ -848,10 +931,28 @@ def build_standard_slides(briefing: dict, builder: Any) -> None:
             ]
             for r in pl_rows
         ]
+        
+        # Build chart showing worst performers (accuracy < 70%)
+        pl_labels = [r["Product Line"][:20] + "..." if len(r["Product Line"]) > 20 else r["Product Line"] 
+                     for r in pl_rows[:10]]  # Top 10 worst
+        pl_df_acc = [round(r["df_acc"] * 100, 1) if r["df_acc"] is not None else None for r in pl_rows[:10]]
+        pl_stat_acc = [round(r["stat_acc"] * 100, 1) if r["stat_acc"] is not None else None for r in pl_rows[:10]]
+        
         builder.add_slide(Slide(
             slide_id="by_product_line",
-            layout="table",
-            title="Product Line Performance (worst first)",
+            layout="chart_table",
+            title="Product Line Performance - Worst First",
+            subtitle="Focus on products with accuracy < 60% (critical) or 60-70% (concern)",
+            chart=ChartSpec(
+                chart_type="bar",
+                title="Top 10 Worst Product Lines - DF vs Stat Accuracy",
+                x_data=pl_labels,
+                y_data={"DF Accuracy %": pl_df_acc, "Stat Accuracy %": pl_stat_acc},
+                x_label="Product Line",
+                y_label="Accuracy %",
+                show_legend=True,
+                height=280,
+            ),
             table=TableSpec(
                 headers=headers,
                 rows=table_rows,
@@ -875,10 +976,28 @@ def build_standard_slides(briefing: dict, builder: Any) -> None:
             ]
             for r in ibp5_rows
         ]
+        
+        # Build chart for worst performers
+        ibp5_labels = [r["IBP Level 5"][:25] + "..." if len(r["IBP Level 5"]) > 25 else r["IBP Level 5"]
+                       for r in ibp5_rows[:10]]
+        ibp5_df_acc = [round(r["df_acc"] * 100, 1) if r["df_acc"] is not None else None for r in ibp5_rows[:10]]
+        ibp5_fva = [round(r["fva"] * 100, 1) if r["fva"] is not None else None for r in ibp5_rows[:10]]
+        
         builder.add_slide(Slide(
             slide_id="by_ibp5",
-            layout="table",
-            title="IBP Level 5 Performance (worst first)",
+            layout="chart_table",
+            title="IBP Level 5 Performance - Worst First",
+            subtitle="Granular product view for root cause analysis",
+            chart=ChartSpec(
+                chart_type="bar",
+                title="Top 10 Worst IBP Level 5 - DF Accuracy & FVA",
+                x_data=ibp5_labels,
+                y_data={"DF Accuracy %": ibp5_df_acc, "FVA %": ibp5_fva},
+                x_label="IBP Level 5",
+                y_label="Percentage",
+                show_legend=True,
+                height=280,
+            ),
             table=TableSpec(
                 headers=headers,
                 rows=table_rows,

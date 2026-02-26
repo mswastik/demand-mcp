@@ -647,19 +647,21 @@ def detect_anomalies_in_trend(
     lag: str = "L2",
     window: str = "last_12_months",
     filters: Optional[dict] = None,
-    threshold_std: float = 2.0,
+    threshold_std: float = 1,
+    return_all: bool = False,
+    top_n: Optional[int] = None,
 ) -> dict:
     """
     Detect statistical anomalies in metric trends over time.
-    
+
     Uses rolling statistics (3-month rolling mean ± N standard deviations) to
     identify months where the metric deviated significantly from the trend.
-    
+
     Use this to find:
     - Sudden drops in forecast accuracy that need investigation
     - Unusual bias spikes indicating process issues
     - Volume anomalies that may explain accuracy problems
-    
+
     Parameters
     ----------
     group_by : hierarchy columns to group by (SALES_DATE is always added),
@@ -668,28 +670,50 @@ def detect_anomalies_in_trend(
     lag : 'L2' | 'L1' | 'L0' | 'Fcst' — forecast lag (for accuracy/bias)
     window : time window for analysis (default: last_12_months)
     filters : optional {col: value} filters to scope the analysis
-    threshold_std : number of standard deviations for anomaly detection (default: 2.0)
-                    Lower = more sensitive, Higher = only major anomalies
-    
+    threshold_std : number of standard deviations for anomaly detection (default: 1)
+                    Lower = more sensitive (more anomalies), Higher = fewer anomalies
+                    Try 0.6 for sensitive, 1.0+ for strict
+    return_all : if True, return all data points; if False (default), return only anomalies
+    top_n : if set, return only top N anomalies sorted by deviation magnitude
+            (if no anomalies found, returns top N deviations anyway)
+
     Returns
     -------
-    Table with one row per (group, month) including:
+    Table with one row per anomaly (or per month if return_all=True) including:
       - metric value (accuracy/bias/volume)
       - rolling_mean, rolling_std (3-month window)
       - lower_bound, upper_bound (anomaly thresholds)
       - is_anomaly (boolean)
       - anomaly_direction ('high' | 'low' | None)
-    
+      - deviation_magnitude (z-score for ranking)
+
     Usage pattern
     -------------
     1. Call with group_by=["Forecast Level"] to find anomalous regions
     2. Filter to anomalous region, call with group_by=["Franchise"]
     3. Continue drilling down to root cause level
     4. Use findings to add drill-down slides via drill_down_slide()
+
+    Examples
+    --------
+    # Get only anomalies (default, compact output):
+    detect_anomalies_in_trend(group_by=["Forecast Level"])
+
+    # Get top 5 worst anomalies (recommended for LLM context):
+    detect_anomalies_in_trend(group_by=["Franchise"], top_n=5)
+
+    # Use higher threshold for fewer anomalies:
+    detect_anomalies_in_trend(group_by=["Product Line"], threshold_std=1.0)
+
+    # Get all data for custom analysis:
+    detect_anomalies_in_trend(group_by=["Forecast Level"], return_all=True)
+
+    # Sensitive detection (more anomalies):
+    detect_anomalies_in_trend(group_by=["Forecast Level"], threshold_std=0.6)
     """
     ds = _get_ds()
     from metrics import detect_anomalies_in_trend as _detect
-    
+
     result = _detect(
         df_raw=ds.df,
         group_by_cols=group_by,
@@ -698,6 +722,8 @@ def detect_anomalies_in_trend(
         window=window,
         filters=filters,
         threshold_std=threshold_std,
+        return_all=return_all,
+        top_n=top_n,
     )
     return _df_to_dict(result)
 

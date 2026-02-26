@@ -480,14 +480,16 @@ def detect_anomalies_in_trend(
     lag: str = "L2",
     window: str = "last_12_months",
     filters: dict | None = None,
-    threshold_std: float = 2.0,
+    threshold_std: float = 1,
+    return_all: bool = False,
+    top_n: int | None = None,
 ) -> pl.DataFrame:
     """
     Detect anomalies in a metric trend over time using statistical methods.
-    
+
     An anomaly is defined as a data point that deviates more than `threshold_std`
     standard deviations from the rolling mean (window=12 months).
-    
+
     Parameters
     ----------
     df_raw : normalized DataFrame from DataStore
@@ -496,8 +498,11 @@ def detect_anomalies_in_trend(
     lag : 'L2' | 'L1' | 'L0' | 'Fcst' - which lag to use (for accuracy/bias)
     window : time window for the analysis
     filters : optional dict of {col: value} filters
-    threshold_std : number of standard deviations for anomaly threshold (default 2.0)
-    
+    threshold_std : number of standard deviations for anomaly threshold (default: 1)
+                    Lower = more sensitive (more anomalies), Higher = fewer anomalies
+    return_all : if True, return all data points; if False (default), return only anomalies
+    top_n : if set, return only top N anomalies sorted by deviation magnitude
+
     Returns
     -------
     DataFrame with one row per (group, month) including:
@@ -506,17 +511,23 @@ def detect_anomalies_in_trend(
       - lower_bound, upper_bound
       - is_anomaly (boolean)
       - anomaly_direction ('high' | 'low' | None)
+      - deviation_magnitude (absolute z-score for ranking)
+    
+    Notes
+    -----
+    - If no anomalies are found and top_n is not specified, returns top 10 deviations
+    - This ensures the function always returns useful data instead of empty results
     """
     df = filter_to_actuals_period(df_raw)
-    
+
     if filters:
         df = apply_filters(df, filters)
-    
+
     df = filter_date_window(df, window)
-    
+
     if df.is_empty():
         return pl.DataFrame()
-    
+
     # Compute the base metrics
     df_metrics = compute_accuracy_trend(
         df_raw=df_raw,
@@ -525,10 +536,10 @@ def detect_anomalies_in_trend(
         window=window,
         lag=lag,
     )
-    
+
     if df_metrics.is_empty():
         return pl.DataFrame()
-    
+
     # Select the appropriate column based on metric type
     if metric == "accuracy":
         value_col = f"{lag} DF Accuracy"
@@ -538,46 +549,103 @@ def detect_anomalies_in_trend(
         value_col = "Sum Act Vol"
     else:
         raise ValueError(f"Unknown metric type: {metric}")
-    
+
     if value_col not in df_metrics.columns:
         return pl.DataFrame()
-    
+
     # Compute rolling statistics and detect anomalies per group
     time_col = "SALES_DATE"
     result_dfs = []
-    
+
     group_cols = [c for c in group_by_cols if c in df_metrics.columns]
     
+    # Debug info
+    print(f"[DEBUG] detect_anomalies_in_trend: df_metrics shape={df_metrics.shape}")
+    print(f"[DEBUG] group_cols={group_cols}, value_col={value_col}")
+    print(f"[DEBUG] df_metrics null count in {value_col}: {df_metrics[value_col].null_count()}")
+
     if group_cols:
+        group_count = 0
         for group_vals, grp_df in df_metrics.group_by(group_cols):
             grp_df = grp_df.sort(time_col)
-            grp_df = _add_anomaly_columns(grp_df, value_col, threshold_std)
+            grp_df = _add_anomaly_columns(grp_df, value_col, threshold_std, debug=True)
             result_dfs.append(grp_df)
+            group_count += 1
+            if group_count <= 2:  # Only print first 2 groups to avoid spam
+                print(f"[DEBUG] Processed group: {group_vals}, rows={grp_df.height}")
+        print(f"[DEBUG] Total groups processed: {group_count}")
     else:
         grp_df = df_metrics.sort(time_col)
-        grp_df = _add_anomaly_columns(grp_df, value_col, threshold_std)
+        grp_df = _add_anomaly_columns(grp_df, value_col, threshold_std, debug=True)
         result_dfs.append(grp_df)
-    
-    return pl.concat(result_dfs).sort(group_cols + [time_col])
+
+    result = pl.concat(result_dfs).sort(group_cols + [time_col])
+
+    # Filter out rows with null deviation_magnitude (zero volume items, no valid stats)
+    print(f"[DEBUG] Before filtering null deviation_magnitude: {result.height} rows")
+    result = result.filter(pl.col("deviation_magnitude").is_not_null())
+    print(f"[DEBUG] After filtering null deviation_magnitude: {result.height} rows")
+
+    # Filter to only anomalies if requested
+    if not return_all:
+        print(f"[DEBUG] Filtering to anomalies only (return_all=False)")
+        result = result.filter(pl.col("is_anomaly"))
+        print(f"[DEBUG] After anomaly filter: {result.height} rows")
+
+    # Return top N anomalies if requested (even if no strict anomalies, return highest deviations)
+    if top_n is not None and not result.is_empty():
+        result = result.sort("deviation_magnitude", descending=True).head(top_n)
+        print(f"[DEBUG] Returning top {top_n}: {result.height} rows")
+    elif top_n is not None and result.is_empty():
+        # No anomalies found, but user wants top N - return highest deviations from all data
+        print(f"[DEBUG] No anomalies found, fetching top {top_n} from all data")
+        all_result = pl.concat(result_dfs).sort(group_cols + [time_col])
+        all_result = all_result.filter(pl.col("deviation_magnitude").is_not_null())
+        result = all_result.sort("deviation_magnitude", descending=True).head(top_n)
+        print(f"[DEBUG] Returning top {top_n} from all: {result.height} rows")
+    elif top_n is None and result.is_empty() and not return_all:
+        # No anomalies found and user didn't specify top_n - return top 10 deviations
+        # This ensures the tool always returns useful data instead of empty results
+        print(f"[DEBUG] No anomalies + no top_n, returning top 10 deviations")
+        all_result = pl.concat(result_dfs).sort(group_cols + [time_col])
+        all_result = all_result.filter(pl.col("deviation_magnitude").is_not_null())
+        result = all_result.sort("deviation_magnitude", descending=True).head(10)
+        print(f"[DEBUG] Returning top 10: {result.height} rows")
+
+    print(f"[DEBUG] Final result: {result.height} rows")
+    if not result.is_empty():
+        print(f"[DEBUG] Sample output:")
+        print(result.select(["SALES_DATE", value_col, "rolling_mean", "rolling_std", "deviation_magnitude", "is_anomaly"]).head(3))
+
+    return result
 
 
-def _add_anomaly_columns(df: pl.DataFrame, value_col: str, threshold_std: float) -> pl.DataFrame:
+def _add_anomaly_columns(df: pl.DataFrame, value_col: str, threshold_std: float, debug: bool = False) -> pl.DataFrame:
     """Add rolling statistics and anomaly detection columns."""
     min_periods = 3  # Minimum periods for rolling window
     
+    if debug:
+        print(f"[DEBUG] _add_anomaly_columns: input rows={df.height}, value_col={value_col}")
+        print(f"[DEBUG] {value_col} null count: {df[value_col].null_count()}")
+        print(f"[DEBUG] {value_col} non-null count: {df.height - df[value_col].null_count()}")
+
     # Compute rolling mean and std
     df = df.with_columns([
-        pl.col(value_col).rolling_mean(window_size=3, min_periods=min_periods).alias("rolling_mean"),
-        pl.col(value_col).rolling_std(window_size=3, min_periods=min_periods).alias("rolling_std"),
+        pl.col(value_col).rolling_mean(window_size=3, min_samples=min_periods).alias("rolling_mean"),
+        pl.col(value_col).rolling_std(window_size=3, min_samples=min_periods).alias("rolling_std"),
     ])
     
+    if debug:
+        print(f"[DEBUG] rolling_mean null count: {df['rolling_mean'].null_count()}")
+        print(f"[DEBUG] rolling_std null count: {df['rolling_std'].null_count()}")
+
     # Compute bounds
     df = df.with_columns([
         (pl.col("rolling_mean") - threshold_std * pl.col("rolling_std")).alias("lower_bound"),
         (pl.col("rolling_mean") + threshold_std * pl.col("rolling_std")).alias("upper_bound"),
     ])
-    
-    # Detect anomalies
+
+    # Detect anomalies (two steps: first create anomaly_direction, then is_anomaly)
     df = df.with_columns([
         pl.when(pl.col(value_col) < pl.col("lower_bound"))
         .then(pl.lit("low"))
@@ -585,7 +653,31 @@ def _add_anomaly_columns(df: pl.DataFrame, value_col: str, threshold_std: float)
         .then(pl.lit("high"))
         .otherwise(None)
         .alias("anomaly_direction"),
-        (pl.col("anomaly_direction").is_not_null()).alias("is_anomaly"),
+    ])
+
+    df = df.with_columns([
+        pl.col("anomaly_direction").is_not_null().alias("is_anomaly"),
+    ])
+
+    # Calculate deviation magnitude (z-score) for ranking anomalies
+    # Only calculate when both value and rolling_std are non-null and rolling_std > 0
+    df = df.with_columns([
+        pl.when(
+            (pl.col(value_col).is_not_null()) & 
+            (pl.col("rolling_std").is_not_null()) & 
+            (pl.col("rolling_std") > 0)
+        )
+        .then(((pl.col(value_col) - pl.col("rolling_mean")) / pl.col("rolling_std")).abs())
+        .otherwise(None)
+        .alias("deviation_magnitude"),
     ])
     
+    if debug:
+        print(f"[DEBUG] deviation_magnitude null count: {df['deviation_magnitude'].null_count()}")
+        print(f"[DEBUG] deviation_magnitude non-null count: {df.height - df['deviation_magnitude'].null_count()}")
+        non_null_df = df.filter(pl.col("deviation_magnitude").is_not_null())
+        if not non_null_df.is_empty():
+            print(f"[DEBUG] Sample non-null rows:")
+            print(non_null_df.select(["SALES_DATE", value_col, "rolling_mean", "rolling_std", "deviation_magnitude"]).head(3))
+
     return df

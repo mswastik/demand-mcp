@@ -32,7 +32,7 @@ from typing import Any, Literal, Optional
 
 import polars as pl
 
-SlideLayout = Literal["title", "metrics", "chart", "table", "chart_table", "commentary", "two_col"]
+SlideLayout = Literal["title", "metrics", "chart", "table", "chart_table", "two_col", "two_col_chart_table", "commentary"]
 
 
 @dataclass
@@ -67,6 +67,7 @@ class Slide:
     chart: ChartSpec | None = None
     table: TableSpec | None = None
     chart2: ChartSpec | None = None  # for two_col layout
+    cards: list[dict] | None = None  # for metrics layout: card data
     slide_id: str = field(default_factory=lambda: str(uuid.uuid4())[:8])
 
     def __post_init__(self):
@@ -224,6 +225,7 @@ class PresentationBuilder:
             "chart": _chart(s.chart),
             "chart2": _chart(s.chart2),
             "table": _table(s.table),
+            "cards": s.cards,
         }
 
     @staticmethod
@@ -263,6 +265,7 @@ class PresentationBuilder:
             chart=_chart(d.get("chart")),
             chart2=_chart(d.get("chart2")),
             table=_table(d.get("table")),
+            cards=d.get("cards"),
             slide_id=d["slide_id"],  # preserve original IDs
         )
         return slide
@@ -319,7 +322,7 @@ class PresentationBuilder:
       display: flex; flex-direction: column; justify-content: center;
       height: 100%; padding: 2rem;
     }}
-    .slide-title-content h1 {{ font-size: 2rem; color: var(--secondary); margin-bottom: 0.5rem; }}
+    .slide-title-content h1 {{ font-size: 2rem; color: var(--text); margin-bottom: 0.5rem; }}
     .slide-title-content .subtitle {{ font-size: 1rem; color: var(--text-muted); }}
     .title-bar {{
       width: 80px; height: 5px; background: var(--primary);
@@ -457,29 +460,32 @@ class PresentationBuilder:
             return self._render_commentary_slide(slide)
         elif slide.layout == "two_col":
             return self._render_two_col_slide(slide)
+        elif slide.layout == "two_col_chart_table":
+            return self._render_two_col_chart_table_slide(slide)
         return f"<section><h2>{slide.title}</h2></section>"
 
     def _render_title_slide(self, slide: Slide) -> str:
         company = self.brand.get("company_name", "")
         return f"""<section>
   <div class="slide-title-content">
-    <div style="color: var(--text-muted); font-size: 0.85rem;">{company}</div>
-    <h1>{slide.title}</h1>
+  <div class="slide-header">
+    {slide.title}
+    <img style="margin-left:auto;" src="{self.brand.get('logo_path', '')}" alt="Logo" width="11%" height="11%">
+    </div>
     <div class="title-bar"></div>
-    <div class="subtitle">{slide.subtitle or self.subtitle}</div>
-    <div style="margin-top: 2rem; font-size: 0.75rem; color: var(--text-muted);">
+    <div>{slide.commentary or self.subtitle}</div>
+    <div style="margin-top: 2rem; margin-left:auto; font-size: 0.75rem; color: var(--text-muted);">
       {self.created_at.strftime('%B %Y')}
     </div>
   </div>
 </section>"""
 
     def _render_metrics_slide(self, slide: Slide) -> str:
-        # commentary may carry structured metric data as JSON string
+        # cards field contains structured metric data
         # Format: [{"label":"..","value":"..","delta":"..","direction":"up|down|neutral"}]
         cards_html = ""
-        try:
-            cards = json.loads(slide.commentary) if slide.commentary.startswith("[") else []
-            for card in cards:
+        if slide.cards:
+            for card in slide.cards:
                 direction = card.get("direction", "neutral")
                 css_class = "positive" if direction == "up" else ("negative" if direction == "down" else "")
                 delta_html = ""
@@ -492,12 +498,13 @@ class PresentationBuilder:
   <div class="value">{card.get("value","")}</div>
   {delta_html}
 </div>"""
-        except Exception:
-            cards_html = f'<div class="commentary-box">{slide.commentary}</div>'
-
+        
+        comm_html = self._commentary_html(slide.commentary)
+        
         return f"""<section>
   {self._header(slide.title)}
   <div class="metrics-grid">{cards_html}</div>
+  {comm_html}
   {self._footer()}
 </section>"""
 
@@ -545,6 +552,23 @@ class PresentationBuilder:
     <div>{left_html}</div>
     <div>{right_html}</div>
   </div>
+  {comm_html}
+  {self._footer()}
+</section>"""
+
+    def _render_two_col_chart_table_slide(self, slide: Slide) -> str:
+        """Render slide with two charts (top row), table (middle), and commentary (bottom)."""
+        left_html = self._chart_html(slide.chart, slide.slide_id + "L", height=240) if slide.chart else ""
+        right_html = self._chart_html(slide.chart2, slide.slide_id + "R", height=240) if slide.chart2 else ""
+        table_html = self._table_html(slide.table) if slide.table else ""
+        comm_html = self._commentary_html(slide.commentary)
+        return f"""<section>
+  {self._header(slide.title)}
+  <div class="two-col" style="margin-bottom: 0.75rem;">
+    <div>{left_html}</div>
+    <div>{right_html}</div>
+  </div>
+  {table_html}
   {comm_html}
   {self._footer()}
 </section>"""
