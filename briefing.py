@@ -191,7 +191,7 @@ def generate_standard_report(
         briefing["trend"] = {"months": [], "df_acc": [], "stat_acc": []}
 
     try:
-        briefing["yoy"] = _yoy(df_base)
+        briefing["yoy"] = _yoy(apply_filters(ds.df, filters)) if filters else _yoy(ds.df)
     except Exception as e:
         logger.warning(f"yoy failed: {e}")
         briefing["yoy"] = []
@@ -349,102 +349,56 @@ def _trend(df_base: pl.DataFrame) -> dict:
 
 def _yoy(df_base: pl.DataFrame) -> list[dict]:
     """
-    Year-over-year actual volume: last 3 available years, compact.
-    Current year includes actuals (completed months) + forecast (remaining months).
-    Returns detailed data for table including volume and growth percentages.
+    Year-over-year volume growth using act_with_forecast columns.
+    
+    Uses compute_yoy_growth which creates:
+      - act_with_forecast_df: actuals for completed months + DF forecast for remaining
+      - act_with_forecast_stat: actuals for completed months + Stat forecast for remaining
+    
+    Returns detailed data for table including volumes and YoY growth percentages
+    for both DF and Stat forecast scenarios.
+    Returns all available years (not limited to last 3).
     """
-    from data import FCST_DF_VOL, FCST_STAT_VOL, ACT_VOL
-    from datetime import date
+    from metrics import compute_yoy_growth
 
     if df_base.is_empty():
         return []
 
-    # Determine current year for labeling
-    today = date.today()
-    current_year = today.year
-    last_completed_month = today.month - 1 if today.month > 1 else 12
+    # Use the compute_yoy_growth function which handles act_with_forecast logic
+    result = compute_yoy_growth(df_base, group_by_cols=[])
 
-    # Add year and month columns
-    df_y = df_base.with_columns([
-        pl.col("SALES_DATE").dt.year().alias("Year"),
-        pl.col("SALES_DATE").dt.month().alias("Month"),
-    ])
-    
-    # Split current year and historical years
-    df_current = df_y.filter(pl.col("Year") == current_year)
-    df_historical = df_y.filter(pl.col("Year") < current_year)
-    
-    # For current year: actuals for completed months + forecast for remaining
-    df_current_actuals = df_current.filter(pl.col("Month") <= last_completed_month)
-    df_current_forecast = df_current.filter(pl.col("Month") > last_completed_month)
-    
-    # Aggregate historical years
-    if not df_historical.is_empty():
-        historical_agg = df_historical.group_by("Year").agg([
-            pl.col(ACT_VOL).sum().alias("act_vol"),
-            pl.col(FCST_DF_VOL).sum().alias("df_vol"),
-            pl.col(FCST_STAT_VOL).sum().alias("stat_vol"),
-        ])
-    else:
-        historical_agg = None
-    
-    # Aggregate current year actuals
-    if not df_current_actuals.is_empty():
-        current_actuals_agg = df_current_actuals.group_by("Year").agg([
-            pl.col(ACT_VOL).sum().alias("act_vol"),
-            pl.col(FCST_DF_VOL).sum().alias("df_vol"),
-            pl.col(FCST_STAT_VOL).sum().alias("stat_vol"),
-        ])
-    else:
-        current_actuals_agg = None
-    
-    # Add forecast for remaining months to current year
-    if not df_current_forecast.is_empty() and current_actuals_agg is not None:
-        forecast_remaining = df_current_forecast.group_by("Year").agg([
-            pl.col(FCST_DF_VOL).sum().alias("df_fcst_rem"),
-            pl.col(FCST_STAT_VOL).sum().alias("stat_fcst_rem"),
-        ])
-        current_agg = current_actuals_agg.join(forecast_remaining, on="Year", how="left").with_columns([
-            (pl.col("act_vol") + pl.col("df_fcst_rem")).alias("act_vol"),
-            (pl.col("df_vol") + pl.col("df_fcst_rem")).alias("df_vol"),
-            (pl.col("stat_vol") + pl.col("stat_fcst_rem")).alias("stat_vol"),
-        ])
-    elif current_actuals_agg is not None:
-        current_agg = current_actuals_agg
-    else:
-        current_agg = None
-    
-    # Combine historical and current
-    if historical_agg is not None and current_agg is not None:
-        combined = pl.concat([historical_agg, current_agg])
-    elif current_agg is not None:
-        combined = current_agg
-    elif historical_agg is not None:
-        combined = historical_agg
-    else:
+    if result.is_empty():
         return []
-    
-    # Sort and compute YoY
-    combined = combined.sort("Year")
-    rows = combined.tail(3).iter_rows(named=True)
-    
-    result = []
-    prev_act = None
+
+    # Sort by year - return all available years
+    result = result.sort("Year")
+
+    rows = result.iter_rows(named=True)
+    output = []
+
     for row in rows:
         entry = {
             "year": row["Year"],
-            "is_current": row["Year"] == current_year,
-            "act_vol": _safe(row["act_vol"]),
-            "df_vol": _safe(row["df_vol"]),
-            "stat_vol": _safe(row["stat_vol"]),
+            # Volumes
+            "act_vol": _safe(row.get("Sum Act Vol")),
+            "act_with_forecast_df_vol": _safe(row.get("Sum act_with_forecast_df Vol")),
+            "act_with_forecast_stat_vol": _safe(row.get("Sum act_with_forecast_stat Vol")),
+            "df_vol": _safe(row.get("Sum DF Fcst Vol")),
+            "stat_vol": _safe(row.get("Sum Stat Fcst Vol")),
+            # YoY growth percentages - these are the key metrics for the presentation
+            "df_yoy_pct": _safe(row.get("DF Fcst YoY %")),
+            "stat_yoy_pct": _safe(row.get("Stat Fcst YoY %")),
+            "act_yoy_pct": _safe(row.get("Act YoY %")),
         }
-        if prev_act and prev_act != 0:
-            entry["yoy_pct"] = _safe((row["act_vol"] - prev_act) / prev_act)
-        else:
-            entry["yoy_pct"] = None
-        prev_act = row["act_vol"]
-        result.append(entry)
-    return result
+        output.append(entry)
+
+    # Mark current year
+    from datetime import date
+    current_year = date.today().year
+    for entry in output:
+        entry["is_current"] = entry["year"] == current_year
+
+    return output
 
 
 def _evolution(df_base: pl.DataFrame, window: str) -> dict:
@@ -763,8 +717,10 @@ def build_standard_slides(briefing: dict, builder: Any) -> None:
     window = briefing.get("window", "")
     scope = ", ".join(v for k, v in filters.items()) if filters else "All"
     dr = briefing.get("date_range", {})
-    period_label = f"""<div style="padding-top:60px; padding-bottom:160px; font-family:Arial Black;>{scope}</div>
-                        <div style="font-size: 0.75rem; color: var(--text-muted); margin-top:auto;">{dr.get('min','')} to {dr.get('max','')} | Window: {window}</div>"""
+    period_label = f"""
+                    <div style="padding-top:60px; padding-bottom:160px; font-family:Arial Black;>{scope}</div>
+                    <div style="font-size: 0.75rem; color: var(--text-muted); margin-top:auto;">{dr.get('min','')} to {dr.get('max','')} | Window: {window}</div>
+                    """
 
     # ── Slide 1: Cover ────────────────────────────────────────────────────────
     builder.add_slide(Slide(
@@ -1062,41 +1018,62 @@ def build_standard_slides(briefing: dict, builder: Any) -> None:
     # ── Slide 9: YoY Volume Growth ────────────────────────────────────────────
     yoy_rows = briefing.get("yoy", [])
     if len(yoy_rows) >= 2:
-        years = [str(r["year"]) + (" (E)" if r.get("is_current") else "") for r in yoy_rows]
-        vols = [r["act_vol"] for r in yoy_rows]
-        
-        # Build detailed table with volumes and growth rates
-        table_headers = ["Year", "Actual Volume", "DF Forecast", "Stat Forecast", "YoY Growth %"]
+        #years_e = [str(r["year"]) + (" (E)" if r.get("is_current") else "") for r in yoy_rows]
+        years = [str(r["year"]) for r in yoy_rows]
+        # Use act_with_forecast_df_vol for the chart (shows actuals + DF forecast for current year)
+        vols_df = [r["act_with_forecast_df_vol"] for r in yoy_rows]
+        vols_stat = [r["act_with_forecast_stat_vol"] for r in yoy_rows]
+        # YoY growth percentages
+        df_yoy = [r["df_yoy_pct"] for r in yoy_rows]
+        stat_yoy = [r["stat_yoy_pct"] for r in yoy_rows]
+
+        # Build detailed table with volumes and growth rates for both DF and Stat scenarios
+        table_headers = [
+            "Year", 
+            "Actual Volume", 
+            "Act+DF Fcst Vol", 
+            "Act+Stat Fcst Vol",
+            "DF YoY %",
+            "Stat YoY %"
+        ]
         table_rows = []
         for r in yoy_rows:
             year_label = str(r["year"]) + (" (E)" if r.get("is_current") else "")
-            yoy_pct_str = f"{r['yoy_pct']*100:+.1f}%" if r.get("yoy_pct") is not None else "N/A"
+            df_yoy_str = f"{r['df_yoy_pct']:+.1f}%" if r.get("df_yoy_pct") is not None else "N/A"
+            stat_yoy_str = f"{r['stat_yoy_pct']:+.1f}%" if r.get("stat_yoy_pct") is not None else "N/A"
             table_rows.append([
                 year_label,
                 f"{r['act_vol']:,.0f}" if r["act_vol"] else "N/A",
-                f"{r['df_vol']:,.0f}" if r.get("df_vol") else "N/A",
-                f"{r['stat_vol']:,.0f}" if r.get("stat_vol") else "N/A",
-                yoy_pct_str,
+                f"{r['act_with_forecast_df_vol']:,.0f}" if r.get("act_with_forecast_df_vol") else "N/A",
+                f"{r['act_with_forecast_stat_vol']:,.0f}" if r.get("act_with_forecast_stat_vol") else "N/A",
+                df_yoy_str,
+                stat_yoy_str,
             ])
-        
+
         builder.add_slide(Slide(
             slide_id="yoy_growth",
             layout="chart_table",
             title="Year-over-Year Volume Growth",
+            subtitle="Current year includes actuals (completed months) + forecast (remaining months)",
             chart=ChartSpec(
-                chart_type="bar",
-                title="Annual Actual Volume (Current year includes forecast for remaining months)",
+                chart_type="combo_bar_line",
+                title="Annual Volume & YoY Growth (DF vs Stat)",
                 x_data=years,
-                y_data=vols,
+                y_data={
+                    "Act+DF Fcst Vol": vols_df,
+                    "Act+Stat Fcst Vol": vols_stat,
+                    "DF YoY %": df_yoy,
+                    "Stat YoY %": stat_yoy,
+                },
                 x_label="Year",
-                y_label="Units",
-                show_legend=False,
+                y_label="Volume (Units)",
+                show_legend=True,
                 height=280,
             ),
             table=TableSpec(
                 headers=table_headers,
                 rows=table_rows,
-                highlight_col=4,  # Highlight YoY Growth % column
+                highlight_col=4,  # Highlight DF YoY % column
                 highlight_thresholds=(-5, 5),  # Red if < -5%, Green if > +5%
             ),
         ))

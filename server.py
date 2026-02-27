@@ -647,9 +647,9 @@ def detect_anomalies_in_trend(
     lag: str = "L2",
     window: str = "last_12_months",
     filters: Optional[dict] = None,
-    threshold_std: float = 1,
+    threshold_std: float = 1.1,
     return_all: bool = False,
-    top_n: Optional[int] = None,
+    top_n: Optional[int] = 15,
 ) -> dict:
     """
     Detect statistical anomalies in metric trends over time.
@@ -670,7 +670,7 @@ def detect_anomalies_in_trend(
     lag : 'L2' | 'L1' | 'L0' | 'Fcst' — forecast lag (for accuracy/bias)
     window : time window for analysis (default: last_12_months)
     filters : optional {col: value} filters to scope the analysis
-    threshold_std : number of standard deviations for anomaly detection (default: 1)
+    threshold_std : number of standard deviations for anomaly detection (default: 1.1)
                     Lower = more sensitive (more anomalies), Higher = fewer anomalies
                     Try 0.6 for sensitive, 1.0+ for strict
     return_all : if True, return all data points; if False (default), return only anomalies

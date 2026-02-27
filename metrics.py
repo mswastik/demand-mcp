@@ -197,21 +197,29 @@ def compute_yoy_growth(
     filters: dict | None = None,
 ) -> pl.DataFrame:
     """
-    Year-over-year growth comparison with corrected current year calculation.
+    Year-over-year growth comparison using act_with_forecast columns.
+
+    Creates `act_with_forecast` columns that use:
+      - Actuals for completed months (through last month)
+      - Forecasts for current and future months
     
-    Current year volume = Actuals (completed months) + DF/Stat Forecast (remaining months)
-    This ensures fair YoY comparison since current year is incomplete.
+    This enables YoY comparison for all periods including future months.
     
+    Creates two forecast columns:
+      - act_with_forecast_df: uses DF forecast for future periods
+      - act_with_forecast_stat: uses Stat forecast for future periods
+
     Returns one row per (group, year) with:
-      - Sum Act Vol (historical years), Sum Act+Fcst Vol (current year)
+      - Sum Act Vol (actuals only)
+      - Sum act_with_forecast_df Vol (actuals + DF forecast for future)
+      - Sum act_with_forecast_stat Vol (actuals + Stat forecast for future)
       - Sum DF Fcst Vol, Sum Stat Fcst Vol
       - YoY growth % for each
     """
     from data import FCST_DF_VOL, FCST_STAT_VOL
     from datetime import date
-    
-    df = filter_to_actuals_period(df_raw)
 
+    df = df_raw.clone()
     if filters:
         df = apply_filters(df, filters)
 
@@ -220,112 +228,72 @@ def compute_yoy_growth(
 
     # Determine current year and last completed month
     today = date.today()
-    current_year = today.year
-    last_completed_month = today.month - 1 if today.month > 1 else 12
-    
-    # Split data into historical (complete years) and current year
+    #current_year = today.year
+    last_month = date(today.year,today.month-1,1)
+
+    # Add year and month columns
     df_with_year = df.with_columns([
         pl.col("SALES_DATE").dt.year().alias("Year"),
         pl.col("SALES_DATE").dt.month().alias("Month"),
     ])
-    
-    # For current year: use actuals for completed months, forecast for remaining
-    df_current = df_with_year.filter(pl.col("Year") == current_year)
-    df_historical = df_with_year.filter(pl.col("Year") < current_year)
-    
-    # Current year actuals (completed months only)
-    df_current_actuals = df_current.filter(pl.col("Month") <= last_completed_month)
-    
-    # Current year forecast (remaining months) - use Fcst lag
-    df_current_forecast = df_current.filter(pl.col("Month") > last_completed_month)
-    
+
+    # Create act_with_forecast columns:
+    # - For completed months (Month <= last_completed_month): use actuals
+    # - For current/future months (Month > last_completed_month): use forecasts
+    df_with_year = df_with_year.with_columns([
+        pl.when(pl.col("SALES_DATE") <= last_month)
+        .then(pl.col(ACT_VOL))
+        .otherwise(pl.col(FCST_DF_VOL))
+        .alias("act_with_forecast_df"),
+        pl.when(pl.col("SALES_DATE") <= last_month)
+        .then(pl.col(ACT_VOL))
+        .otherwise(pl.col(FCST_STAT_VOL))
+        .alias("act_with_forecast_stat"),
+    ])
+
     year_groups = group_by_cols + ["Year"]
-    
-    # Historical years: sum actuals
-    historical_agg = df_historical.group_by(year_groups).agg([
+
+    # Aggregate all volumes by year
+    aggregated = df_with_year.group_by(year_groups).agg([
         pl.col(ACT_VOL).sum().alias("Sum Act Vol"),
+        pl.col("act_with_forecast_df").sum().alias("Sum act_with_forecast_df Vol"),
+        pl.col("act_with_forecast_stat").sum().alias("Sum act_with_forecast_stat Vol"),
         pl.col(FCST_DF_VOL).sum().alias("Sum DF Fcst Vol"),
         pl.col(FCST_STAT_VOL).sum().alias("Sum Stat Fcst Vol"),
     ])
-    
-    # Current year: actuals (completed months) + forecast (remaining months)
-    if not df_current_actuals.is_empty():
-        current_actuals_agg = df_current_actuals.group_by(year_groups).agg([
-            pl.col(ACT_VOL).sum().alias("Sum Act Vol"),
-            pl.col(FCST_DF_VOL).sum().alias("Sum DF Fcst Vol"),
-            pl.col(FCST_STAT_VOL).sum().alias("Sum Stat Fcst Vol"),
-        ])
-    else:
-        current_actuals_agg = pl.DataFrame(schema=historical_agg.schema)
-    
-    if not df_current_forecast.is_empty():
-        # For remaining months, use forecast volumes as the "actual" equivalent
-        current_forecast_agg = df_current_forecast.group_by(year_groups).agg([
-            pl.col(FCST_DF_VOL).sum().alias("Sum DF Fcst Vol (Rem)"),
-            pl.col(FCST_STAT_VOL).sum().alias("Sum Stat Fcst Vol (Rem)"),
-        ])
-        
-        # Add forecast for remaining months to get total current year volume
-        current_agg = current_actuals_agg.join(
-            current_forecast_agg,
-            on=group_by_cols if group_by_cols else ["Year"],
-            how="left"
-        ).with_columns([
-            (pl.col("Sum Act Vol") + pl.col("Sum DF Fcst Vol (Rem)")).alias("Sum Act Vol (Incl Fcst)"),
-            (pl.col("Sum DF Fcst Vol") + pl.col("Sum DF Fcst Vol (Rem)")).alias("Sum DF Fcst Vol (Total)"),
-            (pl.col("Sum Stat Fcst Vol") + pl.col("Sum Stat Fcst Vol (Rem)")).alias("Sum Stat Fcst Vol (Total)"),
-        ])
-    else:
-        current_agg = current_actuals_agg.with_columns([
-            pl.col("Sum Act Vol").alias("Sum Act Vol (Incl Fcst)"),
-            pl.col("Sum DF Fcst Vol").alias("Sum DF Fcst Vol (Total)"),
-            pl.col("Sum Stat Fcst Vol").alias("Sum Stat Fcst Vol (Total)"),
-        ])
-    
-    # Combine historical and current
-    if not historical_agg.is_empty() and not current_agg.is_empty():
-        # Rename columns to match
-        current_final = current_agg.select([
-            pl.col(c).alias(c) for c in historical_agg.columns
-        ] + [
-            pl.col("Sum Act Vol (Incl Fcst)").alias("Sum Act Vol"),
-            pl.col("Sum DF Fcst Vol (Total)").alias("Sum DF Fcst Vol"),
-            pl.col("Sum Stat Fcst Vol (Total)").alias("Sum Stat Fcst Vol"),
-        ])
-        combined = pl.concat([historical_agg, current_final])
-    elif not current_agg.is_empty():
-        combined = current_agg
-    else:
-        combined = historical_agg
-    
-    combined = combined.sort(year_groups)
+
+    aggregated = aggregated.sort(year_groups)
 
     # Compute YoY growth % using shift within each group
     results = []
     group_keys = group_by_cols if group_by_cols else []
 
     if group_keys:
-        for group_vals, grp_df in combined.group_by(group_keys):
+        for group_vals, grp_df in aggregated.group_by(group_keys):
             grp_df = grp_df.sort("Year")
-            grp_df = _add_yoy_cols(grp_df)
+            grp_df = _add_yoy_cols_extended(grp_df)
             results.append(grp_df)
         return pl.concat(results).sort(year_groups)
     else:
-        combined = combined.sort("Year")
-        return _add_yoy_cols(combined)
+        aggregated = aggregated.sort("Year")
+        return _add_yoy_cols_extended(aggregated)
 
 
-def _add_yoy_cols(df: pl.DataFrame) -> pl.DataFrame:
-    """Add YoY % change columns using shift."""
+def _add_yoy_cols_extended(df: pl.DataFrame) -> pl.DataFrame:
+    """Add YoY % change columns using shift for all volume columns."""
     for col, alias in [
         ("Sum Act Vol", "Act YoY %"),
-        ("Sum DF Fcst Vol", "DF Fcst YoY %"),
-        ("Sum Stat Fcst Vol", "Stat Fcst YoY %"),
+        ("Sum act_with_forecast_df Vol", "DF Fcst YoY %"),
+        ("Sum act_with_forecast_stat Vol", "Stat Fcst YoY %"),
+        ("Sum DF Fcst Vol", "DF Fcst Vol YoY %"),
+        ("Sum Stat Fcst Vol", "Stat Fcst Vol YoY %"),
     ]:
-        prev = df[col].shift(1)
-        curr = df[col]
-        yoy = ((curr - prev) / prev * 100).alias(alias)
-        df = df.with_columns(yoy)
+        if col in df.columns:
+            prev = df[col].shift(1)
+            curr = df[col]
+            # Guard against division by zero
+            yoy = pl.when(prev != 0).then(((curr - prev) / prev * 100)).otherwise(None).alias(alias)
+            df = df.with_columns(yoy)
     return df
 
 
@@ -480,9 +448,9 @@ def detect_anomalies_in_trend(
     lag: str = "L2",
     window: str = "last_12_months",
     filters: dict | None = None,
-    threshold_std: float = 1,
+    threshold_std: float = 1.1,
     return_all: bool = False,
-    top_n: int | None = None,
+    top_n: int | None = 15,
 ) -> pl.DataFrame:
     """
     Detect anomalies in a metric trend over time using statistical methods.
@@ -498,7 +466,7 @@ def detect_anomalies_in_trend(
     lag : 'L2' | 'L1' | 'L0' | 'Fcst' - which lag to use (for accuracy/bias)
     window : time window for the analysis
     filters : optional dict of {col: value} filters
-    threshold_std : number of standard deviations for anomaly threshold (default: 1)
+    threshold_std : number of standard deviations for anomaly threshold (default: 1.1)
                     Lower = more sensitive (more anomalies), Higher = fewer anomalies
     return_all : if True, return all data points; if False (default), return only anomalies
     top_n : if set, return only top N anomalies sorted by deviation magnitude

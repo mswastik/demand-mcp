@@ -38,7 +38,7 @@ SlideLayout = Literal["title", "metrics", "chart", "table", "chart_table", "two_
 @dataclass
 class ChartSpec:
     """Plotly chart specification."""
-    chart_type: Literal["line", "bar", "grouped_bar", "waterfall", "heatmap", "scatter"]
+    chart_type: Literal["line", "bar", "grouped_bar", "waterfall", "heatmap", "scatter", "combo_bar_line"]
     title: str
     x_data: list
     y_data: list | dict  # dict for multi-series: {"Series Name": [values]}
@@ -644,6 +644,8 @@ class PresentationBuilder:
 
         if spec.chart_type == "line":
             plotly_spec = self._line_chart(spec, palette, h)
+        elif spec.chart_type == "combo_bar_line":
+            plotly_spec = self._combo_chart(spec, palette, h)
         elif spec.chart_type in ("bar", "grouped_bar"):
             plotly_spec = self._bar_chart(spec, palette, h)
         elif spec.chart_type == "waterfall":
@@ -711,6 +713,65 @@ class PresentationBuilder:
             })
         layout = self._base_layout(spec, height)
         layout["barmode"] = barmode
+        return {"data": traces, "layout": layout}
+
+    def _combo_chart(self, spec: ChartSpec, palette: list, height: int) -> dict:
+        traces = []
+        y_data = spec.y_data
+        if isinstance(y_data, dict):
+            for i, (name, values) in enumerate(y_data.items()):
+                # First two series as bars, the rest as lines
+                chart_type = "bar" if i < 2 else "scatter"
+                trace = {
+                    "type": chart_type,
+                    "name": name,
+                    "x": spec.x_data,
+                    "y": values,
+                }
+                if chart_type == "bar":
+                    trace["marker"] = {"color": palette[i % len(palette)]}
+                else:
+                    trace["mode"] = "lines+markers"
+                    trace["line"] = {"color": palette[i % len(palette)], "width": 2}
+                    trace["marker"] = {"size": 5}
+                    trace["yaxis"] = "y2"
+                traces.append(trace)
+
+        layout = self._base_layout(spec, height)
+        layout["barmode"] = "group"
+        layout["yaxis2"] = {
+            "title": "Growth %",
+            "overlaying": "y",
+            "side": "right",
+            "showgrid": False,
+        }
+
+        # Align y-axis zeros if the percentage range crosses zero
+        vol_series = list(y_data.values())[:2]
+        pct_series = list(y_data.values())[2:]
+        all_vols = [v for series in vol_series for v in series if v is not None]
+        all_pcts = [p for series in pct_series for p in series if p is not None]
+
+        if all_vols and all_pcts:
+            max_v = max(all_vols)
+            min_p = min(all_pcts)
+            max_p = max(all_pcts)
+
+            if min_p < 0 and max_p > 0:
+                # Add padding
+                max_v_pad = max_v * 1.1
+                max_p_pad = max_p * 1.1
+                min_p_pad = min_p * 1.1
+                
+                # Ratio of negative range to positive range must be equal for both axes
+                neg_pos_ratio = abs(min_p_pad) / max_p_pad
+                new_min_v = -1 * neg_pos_ratio * max_v_pad
+
+                layout["yaxis"]["range"] = [new_min_v, max_v_pad]
+                layout["yaxis2"]["range"] = [min_p_pad, max_p_pad]
+            else:
+                layout["yaxis"]["rangemode"] = "tozero"
+        
         return {"data": traces, "layout": layout}
 
     def _waterfall_chart(self, spec: ChartSpec, palette: list, height: int) -> dict:
