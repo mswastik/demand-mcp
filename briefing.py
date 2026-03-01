@@ -718,8 +718,8 @@ def build_standard_slides(briefing: dict, builder: Any) -> None:
     scope = ", ".join(v for k, v in filters.items()) if filters else "All"
     dr = briefing.get("date_range", {})
     period_label = f"""
-                    <div style="padding-top:60px; padding-bottom:160px; font-family:Arial Black;>{scope}</div>
-                    <div style="font-size: 0.75rem; color: var(--text-muted); margin-top:auto;">{dr.get('min','')} to {dr.get('max','')} | Window: {window}</div>
+                    <div style="padding:60px 0 210px 60px; font-family:Arial Black;">{scope}</div>
+                    <div style="font-size: 0.75rem; color: var(--text-muted); margin-bottom:-4em;">{dr.get('min','')} to {dr.get('max','')} | Window: {window}</div>
                     """
 
     # ── Slide 1: Cover ────────────────────────────────────────────────────────
