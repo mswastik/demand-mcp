@@ -338,7 +338,6 @@ class PresentationBuilder:
       font-weight: 600;
       display: flex; align-items: center; gap: 0.75rem;
     }}
-    .slide-header .accent-bar {{ width: 4px; height: 1.5rem; background: var(--primary); }}
 
     /* Metric cards */
     .metrics-grid {{
@@ -407,6 +406,43 @@ class PresentationBuilder:
       position: absolute; bottom: 0.4rem; right: 1.5rem;
       font-size: 0.6rem; color: var(--text-muted);
     }}
+
+    /* PDF Export Button */
+    .pdf-export-btn {{
+      position: fixed;
+      bottom: 23px;
+      right: 120px;
+      z-index: 9999;
+      padding: 10px 18px;
+      background: {c['primary']};
+      color: black;
+      border: none;
+      border-radius: 6px;
+      cursor: pointer;
+      font-size: 14px;
+      font-weight: 600;
+      box-shadow: 0 2px 8px rgba(0,0,0,0.2);
+      transition: background 0.2s;
+    }}
+    .pdf-export-btn:hover {{
+      background: {c['primary_dark']};
+    }}
+    @media print {{
+      .pdf-export-btn {{
+        display: none !important;
+      }}
+    }}
+
+    /* Title first word styling - applies to ALL slide headers */
+    .slide-header .title-first-word {{
+      color: var(--primary) !important;
+    }}
+
+    /* Logo styling - remove border in print */
+    .slide-header img {{
+      border: none !important;
+      outline: none !important;
+    }}
   </style>
 </head>
 <body>
@@ -416,8 +452,50 @@ class PresentationBuilder:
   </div>
 </div>
 
+<!-- PDF Export Button -->
+<button class="pdf-export-btn" onclick="exportToPDF()" title="Download as PDF">
+  ⬇ Download PDF
+</button>
+
 <script src="https://cdnjs.cloudflare.com/ajax/libs/reveal.js/4.6.1/reveal.min.js"></script>
+
 <script>
+  // PDF Export Function - uses Reveal.js print-pdf feature
+  function exportToPDF() {{
+    // If not already in print-pdf mode, reload in that mode
+    if (!window.location.search.includes('print-pdf')) {{
+      // Open a new tab in print-pdf mode, which auto-triggers print
+      // window.open(window.location.href.split('?')[0] + '?print-pdf&autoprint=1','_self');
+      window.location.href = window.location.href.split('?')[0] + '?print-pdf&autoprint=1';
+      return;
+    }}
+  }}
+
+  // Auto-trigger print dialog when ?autoprint=1 is present
+  window.addEventListener('load', () => {{
+    const params = new URLSearchParams(window.location.search);
+    if (params.has('autoprint')) {{
+      // Wait for Reveal to finish rendering and charts to load
+      setTimeout(() => {{
+        window.print();
+      }}, 1000);
+    }}
+  }});
+
+  // Chart render counter for tracking
+  let chartsRendered = 0;
+  let totalCharts = 0;
+
+  // Count total charts on page load
+  document.addEventListener('DOMContentLoaded', function() {{
+    totalCharts = document.querySelectorAll('[data-plotly]').length;
+
+    // Wait for Reveal to be fully initialized, then render charts
+    if (typeof Reveal !== 'undefined' && Reveal.isReady()) {{
+      setTimeout(renderAllCharts, 150);
+    }}
+  }});
+
   Reveal.initialize({{
     hash: true,
     transition: '{self.brand["presentation"]["slide_transition"]}',
@@ -425,19 +503,63 @@ class PresentationBuilder:
     controls: true,
     progress: true,
     center: false,
+    width: 1200,
+    height: 700,
+    margin: 0.1,
+    minScale: 0.75,
+    maxScale: 1.5,
   }});
 
   // Render all Plotly charts after reveal initialises
-  Reveal.on('ready', () => renderAllCharts());
-  Reveal.on('slidechanged', () => renderAllCharts());
+  Reveal.on('ready', () => {{
+    setTimeout(renderAllCharts, 150);
+  }});
+
+  Reveal.on('slidechanged', () => {{
+    setTimeout(renderAllCharts, 100);
+  }});
+
+  // Re-render charts on window resize to fix width issues
+  let resizeTimeout;
+  window.addEventListener('resize', () => {{
+    clearTimeout(resizeTimeout);
+    resizeTimeout = setTimeout(() => {{
+      // Reset chart rendered flags to allow re-rendering with new dimensions
+      document.querySelectorAll('[data-plotly]').forEach(el => {{
+        delete el.dataset.rendered;
+      }});
+      renderAllCharts();
+    }}, 250);
+  }});
 
   function renderAllCharts() {{
     document.querySelectorAll('[data-plotly]').forEach(el => {{
       if (el.dataset.rendered) return;
       try {{
+        // Force reflow to ensure container has correct dimensions
+        void el.offsetWidth;
+
         const spec = JSON.parse(el.dataset.plotly);
-        Plotly.newPlot(el, spec.data, spec.layout, {{responsive: true, displayModeBar: false}});
+        const layout = JSON.parse(JSON.stringify(spec.layout)); // Deep clone layout
+
+        // Calculate proper width based on container - use more of available width
+        const containerWidth = el.parentElement ? el.parentElement.clientWidth : 1000;
+        const chartWidth = Math.max(600, containerWidth * 0.98);
+
+        layout.autosize = true;
+        layout.width = chartWidth;
+        layout.height = spec.layout.height || 380;
+
+        Plotly.newPlot(el, spec.data, layout, {{
+          responsive: true,
+          displayModeBar: false,
+          scrollZoom: false,
+          staticPlot: false,
+          doubleClick: false,
+          showTips: false
+        }});
         el.dataset.rendered = '1';
+        chartsRendered++;
       }} catch(e) {{ console.error('Plotly error', e); }}
     }});
   }}
@@ -466,10 +588,17 @@ class PresentationBuilder:
 
     def _render_title_slide(self, slide: Slide) -> str:
         company = self.brand.get("company_name", "")
+        # Split title and wrap first word in span with primary color
+        title_parts = slide.title.split(' ', 1)
+        if len(title_parts) > 1:
+            title_html = f'<span class="title-first-word">{title_parts[0]}</span> {title_parts[1]}'
+        else:
+            title_html = f'<span class="title-first-word">{title_parts[0]}</span>'
+        
         return f"""<section>
   <div class="slide-title-content">
   <div class="slide-header">
-    {slide.title}
+    {title_html}
     <img style="margin-left:auto;" src="{self.brand.get('logo_path', '')}" alt="Logo" width="11%" height="11%">
     </div>
     <div class="title-bar"></div>
@@ -581,9 +710,15 @@ class PresentationBuilder:
 </section>"""
 
     def _header(self, title: str) -> str:
+        # Split title and wrap first word in span with primary color
+        title_parts = title.split(' ', 1)
+        if len(title_parts) > 1:
+            title_html = f'<span class="title-first-word">{title_parts[0]}</span> {title_parts[1]}'
+        else:
+            title_html = f'<span class="title-first-word">{title_parts[0]}</span>'
+        
         return f"""<div class="slide-header">
-  <div class="accent-bar"></div>
-  {title}
+  {title_html}
   <img style="margin-left:auto;" src="{self.brand.get('logo_path', '')}" alt="Logo" width="11%" height="11%">
 </div>"""
 
